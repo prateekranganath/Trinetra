@@ -1,0 +1,11 @@
+# Pinned to versions verified on Python 3.13.7.
+# numpy/pandas match the interpreter the dataset was inspected with; streamlit is
+# pinned to 1.63.0 because every earlier release caps pandas below 3.0.
+numpy==2.5.1
+pandas==3.0.1
+scipy==1.18.0
+PyYAML==6.0.3
+plotly==7.0.0
+streamlit==1.63.0
+pytest==9.1.1
+psutil==7.2.2

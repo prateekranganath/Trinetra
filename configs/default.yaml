@@ -1,0 +1,59 @@
+# Default configuration for the adaptive variable-resolution 2.5D mapping pipeline.
+#
+# Every number here is a documented default, not a validated optimum. The zone
+# ladder in particular is justified in README.md and is meant to be edited.
+
+dataset:
+  # Where to look for PandaSet sequence folders. Relative paths resolve against
+  # the directory containing this file's project root. A "sequence folder" is any
+  # directory holding both lidar/*.pkl and annotations/semseg/*.pkl, so the layout
+  # works whether the sequence sits at the root, under data/, or as data/001/.
+  root: "."
+  max_search_depth: 2
+
+preprocess:
+  # Points beyond max_range_m are dropped. Measured on frame 00: 98.8% of points
+  # fall within 100 m, so this discards roughly 1.2% of returns.
+  min_range_m: 0.0
+  max_range_m: 100.0
+  # Elevation crop in gravity-aligned world Z, relative to the ego position.
+  z_min_m: -10.0
+  z_max_m: 30.0
+  # Class 0 marks unlabelled returns and is not declared in classes.json; it
+  # appears 5 times in 1 of the 80 frames. Classes 1-4 are Smoke, Exhaust, Spray
+  # or rain, and Reflection, which are sensor artefacts rather than surfaces.
+  # All five are removed by default.
+  drop_classes: [0, 1, 2, 3, 4]
+  # LiDAR device ids to keep. 0 is the 360-degree spinning sensor, 1 is the
+  # forward-facing one. Empty list means keep every device.
+  devices: [0, 1]
+
+grid:
+  # Cell size used by the uniform baseline that matches the adaptive grid's
+  # finest zone. This is the primary cost baseline.
+  uniform_cell_m: 0.1
+  # Cells holding fewer points than this are discarded as unreliable.
+  min_points_per_cell: 1
+  # Representative elevation per cell: p95, max, mean, or min.
+  elevation_stat: "p95"
+  # Distance zones, half-open intervals [r_min, r_max). Cell sizes double between
+  # consecutive zones so coarse cells nest exactly onto fine ones.
+  zones:
+    - {r_min: 0.0,  r_max: 10.0,  cell_m: 0.1}
+    - {r_min: 10.0, r_max: 30.0,  cell_m: 0.2}
+    - {r_min: 30.0, r_max: 60.0,  cell_m: 0.4}
+    - {r_min: 60.0, r_max: 100.0, cell_m: 0.8}
+
+render:
+  # Display raster only. This is a rendering device and has nothing to do with
+  # how the map is stored.
+  display_res_m: 0.2
+  extent_m: 100.0
+  # Cap on points sent to the browser for the 3D view. 170k is too slow to orbit.
+  max_points_3d: 40000
+
+benchmark:
+  repeats: 3
+  # Distance bands used to report elevation error and semantic agreement. Fixed
+  # across every method so the bands stay comparable.
+  bands_m: [0.0, 10.0, 30.0, 60.0, 100.0]

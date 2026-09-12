@@ -1,0 +1,34 @@
+# Dataset. 836 MB of pickles, JPEGs and JSON from PandaSet, read-only and never
+# modified by this project. Discovery finds it by structure, so anyone cloning
+# this repo just drops the sequence folder back in the root.
+Data/
+data/
+
+# Virtual environment. Rebuild with:
+#   python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
+.venv/
+venv/
+env/
+
+# Generated output. The directories themselves are tracked via .gitkeep so a
+# fresh clone has somewhere to write.
+results/*
+!results/.gitkeep
+cache/*
+!cache/.gitkeep
+*.npz
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
