@@ -1,4 +1,7 @@
-# Adaptive Variable-Resolution 2.5D LiDAR Mapping
+# Trinetra
+
+Adaptive variable-resolution 2.5D LiDAR mapping for dynamic environment perception.
+Repository: https://github.com/prateekranganath/Trinetra
 
 Turning sequential PandaSet LiDAR sweeps into a 2.5D elevation-and-semantic map on a
 **foveated grid**: fine cells close to the ego vehicle, progressively coarser cells further
@@ -26,13 +29,18 @@ estimated.
 
 ## Setup
 
-Python 3.13 on Windows. From the project root:
+Python 3.13 on Windows.
 
 ```bash
+git clone https://github.com/prateekranganath/Trinetra.git
+cd Trinetra
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+The PandaSet sequence itself is not tracked in this repository (see `.gitignore`); drop it
+into a top-level `Data/` folder, or anywhere findable by structure per the section below.
 
 Then validate the dataset and run the tests:
 
