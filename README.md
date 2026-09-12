@@ -15,7 +15,7 @@ estimated.
 | Milestone | State |
 | --- | --- |
 | 1. Data foundation and validation | **done** |
-| 2. Preprocessing and uniform grid | not started |
+| 2. Preprocessing and uniform grid | **done** |
 | 3. Adaptive grid | not started |
 | 4. Benchmark harness | not started |
 | 5. Dashboard | not started |
@@ -39,6 +39,7 @@ Then validate the dataset and run the tests:
 ```bash
 python scripts/validate_dataset.py          # checks all 80 frames, about 1.5 s
 python scripts/validate_dataset.py --quick  # first, middle and last frame only
+python scripts/build_uniform_map.py         # preprocess + grid one frame, print a summary
 python -m pytest -q                         # full suite
 python -m pytest -q -m "not slow"           # skip tests that read the real data
 ```
@@ -139,9 +140,9 @@ deliberately negates its yaw for the same reason, and says so.
 
 **Sparse cell tables, not dense arrays.** A dense 0.1 m grid over 200 x 200 m is 4 million
 cells, of which roughly 1.6% are occupied, and it cannot represent mixed resolutions at all.
-Both grid types will therefore share one representation: parallel NumPy arrays with one entry
-per occupied cell. Same fields, same dtypes, only the row count differs, which is what makes
-the memory comparison honest.
+Both grid types share one representation, `CellTable` (`avrmap/grids/common.py`): parallel
+NumPy arrays with one row per occupied cell. Same fields, same dtypes, only the row count
+differs, which is what makes the memory comparison in the eventual benchmark honest.
 
 **No database.** Eighty immutable frames, read in about 10 ms each when warm. There is nothing
 to index and no query workload. Benchmark output goes to CSV and JSON under `results/`, which
@@ -172,7 +173,50 @@ rationale. **These are defensible defaults, not a validated optimum.** They live
 
 The same prototype measured 27,400 adaptive cells against 63,749 for a uniform 0.1 m grid on
 the same points, a 57% reduction at identical near-field resolution. Milestone 4 will
-reproduce that properly across all 80 frames.
+reproduce that properly across all 80 frames, with all default filtering applied.
+
+---
+
+## Preprocessing and the uniform grid
+
+`avrmap/preprocess.py` crops and filters one frame's points in the map frame: range,
+elevation, dropped classes, dropped devices. The four per-criterion drop counts are
+independent, not a partition — a point failing two filters is counted under both — so only
+`n_kept` and the arrays themselves reflect the actual combined result.
+
+`avrmap/grids/common.py` holds `aggregate_cells`, the single kernel both grid types call. It
+takes already-filtered points at one cell size and returns a `CellTable`. There is no Python
+loop over points anywhere in it:
+
+- **Cell keying.** Points are binned by `floor(coord / cell_size)`, then packed into one int64
+  key via row-major indexing over the *actual* bounding box of occupied cells (`(ix - min_ix)
+  * span_y + (iy - min_iy)`). This needs no assumption about how far the data ranges and cannot
+  collide, unlike a fixed-stride key sized for a guessed extent.
+- **Elevation.** One sort orders points by `(cell, z)`. Min, max and mean fall out of segment
+  boundaries and `np.add.reduceat`. `z_ref` defaults to a nearest-rank 95th percentile computed
+  from the same sort, which barely moves for a single spurious high return where a max would
+  jump to it entirely — asserted directly in `test_grids.py`.
+- **Semantic majority vote.** Points are grouped by the combined key `cell * 256 + class`,
+  giving per-cell per-class counts from one more `np.unique`. A monotone score,
+  `count * 256 - class_id`, is reduced per cell with `np.maximum.reduceat`: a strictly higher
+  count always wins, and equal counts resolve to the lower class id, deterministically.
+
+Both grid types call this kernel through `avrmap/grids/uniform.py`, which fixes `zone_id=0`
+and one cell size for the whole range — the adaptive grid in Milestone 3 will call it once per
+zone and concatenate the results with `CellTable.concat`.
+
+Measured on frame 00 through the full pipeline, default config (range crop, class and device
+filters, elevation crop all applied):
+
+| Cell size | Cells | Notes |
+| --- | --- | --- |
+| 0.1 m | 63,611 | matches the 63,749 measured during planning; the gap is from now also dropping the noise classes present in this frame |
+| 0.2 m | 33,946 | |
+| 0.4 m | 15,921 | |
+| 0.8 m | 6,573 | |
+
+`python scripts/build_uniform_map.py` reproduces this, plus preprocessing counts, timing,
+z-range, mean confidence and a per-class cell breakdown, for any frame.
 
 ---
 
@@ -185,7 +229,10 @@ avrmap/          processing library, no UI imports anywhere
   frames.py        Frame dataclass and cached loading
   geometry.py      quaternions, poses, the three coordinate frames
   semantics.py     class names, groups, colour palette
-  grids/           (milestones 2 and 3)
+  preprocess.py    range/height crop, class and device filtering
+  grids/
+    common.py        CellTable and the aggregate_cells kernel
+    uniform.py       the uniform-resolution grid (milestone 3 adds adaptive.py)
 app/             Streamlit dashboard (milestone 5)
 scripts/         command-line entry points
 configs/         default.yaml
@@ -209,3 +256,10 @@ Fast tests build a throwaway PandaSet-shaped tree under pytest's `tmp_path` and 
 failure modes there: unpaired frames, row-count mismatches, missing columns, undeclared
 labels, wrong pose counts. Tests marked `slow` read the actual dataset and skip cleanly when
 it is absent.
+
+87 tests total. `test_preprocess.py` covers each filter in isolation plus their overlap.
+`test_grids.py` covers the aggregation kernel with hand-computable answers (a flat plane, a
+dense square of known side and resolution, elevation statistics on `0..99`, semantic
+tie-breaking, `min_points_per_cell` filtering, `CellTable.concat`) and pins the real frame-00
+cell count at 0.1 m (63,611) as a regression guard, produced by the suite itself rather than
+assumed in advance.
