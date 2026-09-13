@@ -23,7 +23,64 @@ estimated.
 | 4. Benchmark harness | **done** |
 | 5. Dashboard | **done** |
 | 6. Playback and live controls | **done** |
-| 7. Multi-frame accumulation and demo | not started |
+| 7. Multi-frame accumulation and demo | **done** |
+
+All seven milestones are complete. Everything in the original brief's "must have" list works;
+the sections below are the exact, reproducible commands for each part.
+
+---
+
+## Quick start: run the dashboard
+
+```bash
+git clone https://github.com/prateekranganath/Trinetra.git
+cd Trinetra
+python -m venv .venv
+.venv\Scripts\activate            # Windows; use .venv/bin/activate on macOS/Linux
+pip install -r requirements.txt
+```
+
+Drop the PandaSet sequence into a top-level `Data/` folder (or anywhere findable by structure —
+see "The data" below), then:
+
+```bash
+streamlit run app/dashboard.py
+```
+
+This opens a browser tab at `http://localhost:8501`. If it doesn't open automatically, that URL
+is also printed in the terminal. What you'll see, tab by tab:
+
+1. **3D Point Cloud** — the raw and semantic point clouds for the selected frame, side by side.
+2. **2.5D Maps** — the uniform grid, the adaptive grid, and the zone/cell-size map that makes
+   the fovea visible: fine cells (dark) near the vehicle, coarsening outward through the colour
+   scale.
+3. **Comparison** — live cell counts and memory for both grids, updating as you move the frame
+   slider.
+4. **Metrics** — elevation RMSE and semantic agreement per distance band for this frame, plus
+   the full 80-frame reference numbers from `results/benchmark.csv` if that file exists.
+5. **Accumulated Map** — fuse several consecutive frames into one map (Milestone 7); see below.
+
+In the **sidebar**: step through frames with the slider or the Prev/Next buttons, or click
+**Play** to watch the sequence advance on its own — the "Measured UI rate" shown there is this
+dashboard's actual speed on your machine, not an assumed number. The **Zone ladder** and
+**Preprocessing filters** expanders are live: change a cell size or a range crop and every tab
+rebuilds from the new values. **Reset zones and filters to config defaults** puts everything
+back exactly where it started.
+
+To see the project's central result without touching the UI first:
+
+```bash
+python scripts/compare_grids.py         # uniform vs. adaptive on one frame, printed to the terminal
+python scripts/accumulate_map.py        # fuse 5 frames, printed to the terminal
+```
+
+And to reproduce every number in this file yourself:
+
+```bash
+python scripts/validate_dataset.py      # 80/80 frames valid, ~1.5 s
+python scripts/run_benchmark.py         # all 80 frames, all 4 methods, a few minutes
+python -m pytest -q                     # 226 tests, ~20-30 s
+```
 
 ---
 
@@ -367,6 +424,52 @@ Reproduce with `python scripts/run_benchmark.py` (a few minutes for all 80 frame
 
 ---
 
+## Multi-frame accumulation
+
+Every map so far comes from one LiDAR sweep. A single sweep has gaps — occlusion behind a
+parked car, a patch of road the beam grazed at a shallow angle — that a different sweep, taken
+half a second earlier from a slightly different position, may well fill in. `avrmap/accumulate.py`
+fuses a sliding window of consecutive frames into one set of points before gridding, using
+exactly the same `build_uniform_map` / `build_adaptive_map` functions as everywhere else —
+accumulation is a preprocessing-stage concern, not a new kind of grid.
+
+**One frame of reference, not many.** Every frame's LiDAR points already live in the same
+gravity-aligned *world* frame (see Coordinate frames, above); a frame's own map frame is just
+those points translated to *its own* ego position. Accumulation needs exactly one change:
+`preprocess_frame` gained an optional `reference_pose` argument, and every window frame is
+translated to the *reference* (most recent) frame's ego position instead of its own. An older
+frame's points then land exactly where they actually are, relative to where the ego is now.
+
+**Moving objects are the real problem, not a footnote.** Accumulation is valid because the
+static world hasn't moved between frames — a building seen three frames ago is still exactly
+there. A car is not: fusing its points across frames would smear it into a comet trail pointing
+back along its own path. By default, points whose class is in `avrmap.semantics.DYNAMIC_CLASSES`
+are kept only from the reference frame; every other frame in the window contributes its static
+and ground points only. The fused grid becomes a persistent, lower-noise map of the static
+world, with moving things shown only at their current, unsmeared position — closer to how a
+real perception stack would actually use a fused map (a static background plus live object
+tracking) than naively fusing everything. `include_dynamic_history=True` turns this off to
+show the smearing directly rather than hiding it; the dashboard's checkbox does the same.
+
+Measured on frame 20, a 5-frame window (`python scripts/accumulate_map.py --frame 20 --window 5`):
+
+| | Single frame | 5-frame fused |
+| --- | --- | --- |
+| Points | 169,388 | 737,129 |
+| Adaptive cells | 28,281 | 60,096 (+112%) |
+
+More than double the adaptive cell count from fusing five frames spanning half a second of
+driving — real previously-unseen geometry becoming visible, not padding. With
+`--include-dynamic-history`, fused points rise further (840,244) while adaptive cells barely
+move (61,752, +2.8% over the default) — moving-object points mostly land in cells the vehicle's
+own trajectory already occupies over such a short window, exactly the smearing the default
+setting avoids by construction rather than by luck.
+
+`select_window` clamps at the start of the sequence rather than erroring: a 10-frame window
+requested at frame 2 correctly yields frames 0-2, not a crash.
+
+---
+
 ## The dashboard
 
 `streamlit run app/dashboard.py` opens a browser-based dashboard at `localhost:8501`. It wires
@@ -400,6 +503,11 @@ than only filtering the display — see below.
   every rerun, since the matched-size bisection search costs a few hundred milliseconds per
   frame. Below that, the full 80-frame `results/benchmark_summary.json` is shown for reference
   when present, with an `st.info` pointing at `run_benchmark.py` when it isn't.
+- **Accumulated Map** — fuses a sliding window of consecutive frames (Milestone 7, detailed
+  below) ending at whichever frame is selected in the sidebar, with its own window-size slider
+  and a checkbox to include or exclude moving-object history. Shows per-frame point
+  contributions, the fused elevation and semantic rasters, and the resulting cell-count gain
+  over a single frame.
 
 **Playback, and a measured UI rate rather than an assumed one.** Play sets a
 `playing` flag; after every tab renders, the dashboard sleeps to a target interval and calls
@@ -492,6 +600,7 @@ avrmap/          processing library, no UI imports anywhere
   geometry.py      quaternions, poses, the three coordinate frames
   semantics.py     class names, groups, colour palette, vectorized group filtering
   preprocess.py    range/height crop, class and device filtering
+  accumulate.py    sliding-window multi-frame fusion
   grids/
     common.py        CellTable, aggregate_cells, and its point-to-cell map
     uniform.py       the uniform grid, and the uniform_matched cell-size search
@@ -501,7 +610,8 @@ avrmap/          processing library, no UI imports anywhere
 app/             Streamlit dashboard
   dashboard.py     entry point: streamlit run app/dashboard.py
   panels.py        Plotly figure builders, no Streamlit calls
-scripts/         command-line entry points, including run_benchmark.py
+scripts/         command-line entry points: validate_dataset.py, build_uniform_map.py,
+                 compare_grids.py, run_benchmark.py, accumulate_map.py
 configs/         default.yaml
 tests/           pytest suite, mirrors the module names
 results/         benchmark.csv and benchmark_summary.json
@@ -524,7 +634,13 @@ failure modes there: unpaired frames, row-count mismatches, missing columns, und
 labels, wrong pose counts. Tests marked `slow` read the actual dataset and skip cleanly when
 it is absent.
 
-210 tests total. `test_config.py` covers `load_config`'s validation for every rejected shape
+226 tests total. `test_accumulate.py` covers `select_window`'s clamping at the start of the
+sequence, that a window size of 1 reproduces ordinary single-frame preprocessing exactly, that
+points are correctly repositioned relative to the reference frame (checked against the synthetic
+fixture's known 1 m/frame ego motion), and the dynamic-history filter (excluded by default,
+verified to keep exactly the reference frame's own dynamic-class point count and no more) —
+plus a real-data check that a 5-frame window genuinely reveals more adaptive cells than one
+frame alone. `test_config.py` covers `load_config`'s validation for every rejected shape
 (empty/gapped/non-contiguous/finer-outward/non-integer-ratio zones, inverted range or height
 crops, an out-of-range zone ladder, unknown elevation statistics) and `validate_zones` directly,
 including the empty-tuple guard the live editor depends on not to crash on. `test_preprocess.py`

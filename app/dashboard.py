@@ -32,6 +32,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import panels  # noqa: E402
+from avrmap.accumulate import accumulate_window  # noqa: E402
 from avrmap.config import (  # noqa: E402
     ConfigError,
     PreprocessConfig,
@@ -159,6 +160,39 @@ def get_extra_baselines(
     )
     matched = build_uniform_map_with_point_cells(pre, matched_size, min_points_per_cell, elevation_stat)
     return coarse, matched, matched_size
+
+
+@st.cache_data(show_spinner="Fusing the sliding window and gridding the result...")
+def get_accumulated_bundle(
+    config_path: str,
+    seq_id: str,
+    frame_id: str,
+    window_size: int,
+    include_dynamic_history: bool,
+    min_range_m: float,
+    max_range_m: float,
+    z_min_m: float,
+    z_max_m: float,
+    drop_classes: tuple[int, ...],
+    devices: tuple[int, ...],
+    zones: tuple[tuple[float, float, float], ...],
+    min_points_per_cell: int,
+    elevation_stat: str,
+):
+    """Fuse a sliding window ending at ``frame_id`` and grid it, using the
+    same live filter/zone settings as the single-frame views elsewhere in
+    the dashboard — so an edit to either affects both consistently."""
+    cfg = load_config(config_path)
+    seq = require_sequence(cfg.dataset.root, cfg.dataset.max_search_depth, seq_id=seq_id)
+    pp = PreprocessConfig(
+        min_range_m=min_range_m, max_range_m=max_range_m,
+        z_min_m=z_min_m, z_max_m=z_max_m,
+        drop_classes=drop_classes, devices=devices,
+    )
+    result = accumulate_window(seq, frame_id, window_size, pp, include_dynamic_history=include_dynamic_history)
+    zone_objs = tuple(ZoneConfig(r_min=r0, r_max=r1, cell_m=c) for r0, r1, c in zones)
+    adaptive = build_adaptive_map_with_point_cells(result.points, zone_objs, min_points_per_cell, elevation_stat)
+    return result, adaptive
 
 
 @st.cache_data(show_spinner=False)
@@ -419,8 +453,8 @@ def main() -> None:
     uncovered = uncovered_point_count(pre, zones)
     uniform_cell_m = min(z.cell_m for z in zones)
 
-    tab_cloud, tab_maps, tab_compare, tab_metrics = st.tabs(
-        ["3D Point Cloud", "2.5D Maps", "Comparison", "Metrics"]
+    tab_cloud, tab_maps, tab_compare, tab_metrics, tab_accumulate = st.tabs(
+        ["3D Point Cloud", "2.5D Maps", "Comparison", "Metrics", "Accumulated Map"]
     )
 
     # --- tab: 3D point clouds -----------------------------------------------
@@ -601,6 +635,78 @@ def main() -> None:
                 for m, v in summary["methods"].items()
             ]
             st.dataframe(rows, width="stretch", hide_index=True)
+
+    # --- tab: accumulated map -----------------------------------------------
+    with tab_accumulate:
+        st.subheader(f"Sliding window ending at frame {frame_id}")
+        st.caption(
+            "Fuses several consecutive frames into one map, positioned relative to "
+            "this frame's ego — moving the frame slider in the sidebar changes which "
+            "window gets fused. Uses the same live zone and filter settings as the "
+            "rest of the dashboard."
+        )
+        acc_col1, acc_col2 = st.columns(2)
+        window_size = acc_col1.slider("Window size (frames)", 1, 20, 5)
+        include_dynamic_history = acc_col2.checkbox(
+            "Include dynamic-class history (shows smearing)", value=False,
+            help=(
+                "Off (default): moving-object points are kept only from the current "
+                "frame, so the fused map is a clean, persistent view of the static "
+                "world. On: moving-object points from every frame in the window are "
+                "kept too, which smears them into a comet trail — shown deliberately "
+                "rather than hidden, to demonstrate why the default excludes it."
+            ),
+        )
+
+        acc_result, (acc_table, acc_rows) = get_accumulated_bundle(
+            config_path, seq_id, frame_id, window_size, include_dynamic_history,
+            preprocess_cfg.min_range_m, preprocess_cfg.max_range_m,
+            preprocess_cfg.z_min_m, preprocess_cfg.z_max_m,
+            preprocess_cfg.drop_classes, preprocess_cfg.devices,
+            tuple((z.r_min, z.r_max, z.cell_m) for z in zones),
+            cfg.grid.min_points_per_cell, cfg.grid.elevation_stat,
+        )
+
+        if acc_result.window_size < window_size:
+            st.info(
+                f"Requested {window_size} frames but only {acc_result.window_size} "
+                "exist this early in the sequence; using what's available."
+            )
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Frames fused", acc_result.window_size)
+        m2.metric("Points fused", f"{acc_result.points.n_kept:,}")
+        m3.metric(
+            "Adaptive cells", f"{len(acc_table):,}",
+            delta=f"+{(len(acc_table)/len(adaptive_table)-1)*100:.0f}% vs this frame alone"
+            if len(adaptive_table) else None,
+        )
+        st.dataframe(
+            [
+                {"frame": fid, "points contributed": n, "role": "reference (now)" if fid == frame_id else "history"}
+                for fid, n in zip(acc_result.window_frame_ids, acc_result.n_points_per_frame)
+            ],
+            width="stretch", hide_index=True,
+        )
+
+        r1, r2 = st.columns(2)
+        with r1:
+            r = rasterize_scalar(acc_table, acc_table.z_ref, cfg.render.extent_m, cfg.render.display_res_m)
+            st.plotly_chart(
+                panels.raster_scalar_figure(r, "Viridis", "Fused — elevation", "z_ref (m)"),
+                width="stretch",
+            )
+        with r2:
+            r = rasterize_semantic(acc_table, cfg.render.extent_m, cfg.render.display_res_m)
+            st.plotly_chart(panels.raster_rgb_figure(r, "Fused — semantic"), width="stretch")
+
+        if include_dynamic_history:
+            st.warning(
+                "Dynamic-class history is included: moving objects (vehicles, "
+                "pedestrians) will appear smeared across their recent path rather "
+                "than at one clean location. This is the artifact the default "
+                "setting avoids."
+            )
 
     # --- playback: measure the real rerun interval, then advance if playing -
     now = time.perf_counter()

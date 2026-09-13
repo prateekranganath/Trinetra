@@ -1,10 +1,10 @@
 """Point-cloud preprocessing: crop by range and height, drop noise classes and
 unwanted sensors.
 
-Everything here operates on the **map frame** (world axes translated to the
-ego position, see :mod:`avrmap.geometry`), because that is the frame the grids
-are built in. Preprocessing never rotates points, so elevation stays exactly
-what it was in the source pickle.
+Everything here operates on the **map frame** (world axes translated to an
+ego position, see :mod:`avrmap.geometry`), because that is the frame the
+grids are built in. Preprocessing never rotates points, so elevation stays
+exactly what it was in the source pickle.
 
 Filters are computed as independent boolean masks before being combined, so a
 caller can report *why* points were dropped, not just how many. The four
@@ -21,6 +21,7 @@ import numpy as np
 
 from .config import PreprocessConfig
 from .frames import Frame
+from .geometry import Pose, world_to_map
 
 
 @dataclass(frozen=True)
@@ -60,13 +61,25 @@ class PreprocessedPoints:
         return self.n_kept / self.n_input if self.n_input else 0.0
 
 
-def preprocess_frame(frame: Frame, cfg: PreprocessConfig) -> PreprocessedPoints:
+def preprocess_frame(
+    frame: Frame, cfg: PreprocessConfig, reference_pose: Pose | None = None
+) -> PreprocessedPoints:
     """Crop and filter one frame's points according to ``cfg``.
 
     Order does not matter for the result, since all filters combine with a
     single logical AND, but each is still reported independently.
+
+    ``reference_pose`` positions the frame's points relative to a *different*
+    ego pose than its own — every frame's ``xyz_world`` already lives in the
+    same gravity-aligned world frame (see :mod:`avrmap.geometry`), so this is
+    exactly one subtraction, not a new coordinate convention. Defaults to the
+    frame's own pose, i.e. ordinary single-frame preprocessing.
+    :mod:`avrmap.accumulate` is the one caller that passes something else, to
+    place an older frame's points correctly relative to where the ego *is
+    now* rather than where it was when that frame was captured.
     """
-    xyz = frame.xyz_map()
+    pose = reference_pose if reference_pose is not None else frame.pose
+    xyz = world_to_map(frame.xyz_world, pose)
     radius = np.hypot(xyz[:, 0], xyz[:, 1]).astype(np.float32, copy=False)
     sem = frame.semantic
     device = frame.device
