@@ -9,9 +9,26 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from avrmap.config import ZoneConfig
+from avrmap.grids.adaptive import (
+    build_adaptive_map,
+    build_adaptive_map_from_config,
+    uncovered_point_count,
+)
 from avrmap.grids.common import CellTable, aggregate_cells
 from avrmap.grids.uniform import build_uniform_map, build_uniform_map_from_config
 from avrmap.preprocess import PreprocessedPoints
+
+
+def make_points(x, y, z, sem) -> PreprocessedPoints:
+    x, y, z, sem = (np.asarray(a) for a in (x, y, z, sem))
+    r = np.hypot(x, y).astype(np.float32)
+    return PreprocessedPoints(
+        x=x.astype(np.float32), y=y.astype(np.float32), z=z.astype(np.float32),
+        sem=sem.astype(np.uint8), radius=r,
+        n_input=len(x), n_kept=len(x),
+        dropped_range=0, dropped_height=0, dropped_class=0, dropped_device=0,
+    )
 
 
 def cell(x, y, z, sem, **kwargs) -> CellTable:
@@ -192,15 +209,7 @@ class TestCellTable:
 
 
 class TestUniformGrid:
-    def _points(self, x, y, z, sem) -> PreprocessedPoints:
-        x, y, z, sem = (np.asarray(a) for a in (x, y, z, sem))
-        r = np.hypot(x, y).astype(np.float32)
-        return PreprocessedPoints(
-            x=x.astype(np.float32), y=y.astype(np.float32), z=z.astype(np.float32),
-            sem=sem.astype(np.uint8), radius=r,
-            n_input=len(x), n_kept=len(x),
-            dropped_range=0, dropped_height=0, dropped_class=0, dropped_device=0,
-        )
+    _points = staticmethod(make_points)
 
     def test_zone_is_always_zero(self):
         pts = self._points([0.1, 5.1], [0.1, 5.1], [0.0, 1.0], [7, 13])
@@ -278,3 +287,142 @@ class TestUniformGridOnRealData:
             grid = build_uniform_map_from_config(pre, config.grid)
             assert len(grid) > 0
             assert np.isfinite(grid.z_ref).all()
+
+
+TWO_ZONES = (
+    ZoneConfig(r_min=0.0, r_max=10.0, cell_m=0.1),
+    ZoneConfig(r_min=10.0, r_max=20.0, cell_m=1.0),
+)
+
+
+class TestAdaptiveGrid:
+    def test_a_point_at_the_zone_boundary_belongs_to_the_outer_zone(self):
+        # radius exactly 10.0 must land in zone 1's coarse cells, not zone 0's,
+        # matching the half-open [r_min, r_max) contract the config enforces.
+        pts = make_points([10.0], [0.0], [1.0], [7])
+        t = build_adaptive_map(pts, TWO_ZONES)
+        assert len(t) == 1
+        assert t.zone[0] == 1
+        assert t.size[0] == pytest.approx(1.0)
+
+    def test_each_cell_records_its_own_zones_cell_size(self):
+        pts = make_points([1.0, 15.0], [0.0, 0.0], [0.0, 0.0], [7, 7])
+        t = build_adaptive_map(pts, TWO_ZONES)
+        by_zone = dict(zip(t.zone.tolist(), t.size.tolist()))
+        assert by_zone == {0: pytest.approx(0.1), 1: pytest.approx(1.0)}
+
+    def test_point_count_is_conserved_across_zones(self):
+        rng = np.random.default_rng(4)
+        n = 500
+        angle = rng.uniform(0, 2 * np.pi, n)
+        radius = rng.uniform(0, 19.9, n)  # stays inside the two-zone ladder
+        x, y = radius * np.cos(angle), radius * np.sin(angle)
+        pts = make_points(x, y, np.zeros(n), np.full(n, 7))
+        t = build_adaptive_map(pts, TWO_ZONES)
+        assert int(t.n_points.sum()) == n
+
+    def test_a_zone_with_no_points_is_skipped_without_error(self):
+        # Nothing falls in zone 1's 10-20 m ring here.
+        pts = make_points([1.0, 2.0], [0.0, 0.0], [0.0, 0.0], [7, 13])
+        t = build_adaptive_map(pts, TWO_ZONES)
+        assert len(t) > 0
+        assert set(t.zone.tolist()) == {0}
+
+    def test_no_points_at_all_yields_an_empty_table(self):
+        pts = make_points([], [], [], [])
+        t = build_adaptive_map(pts, TWO_ZONES)
+        assert len(t) == 0
+
+    def test_finer_near_zone_beats_a_uniform_grid_at_the_coarse_zones_size(self):
+        # At equal-ish budgets the adaptive grid should resolve near-field
+        # detail a uniform grid at the coarse size cannot.
+        rng = np.random.default_rng(5)
+        n = 3000
+        angle = rng.uniform(0, 2 * np.pi, n)
+        radius = rng.uniform(0, 19.9, n)
+        x, y = radius * np.cos(angle), radius * np.sin(angle)
+        pts = make_points(x, y, np.zeros(n), np.full(n, 7))
+        adaptive = build_adaptive_map(pts, TWO_ZONES)
+        uniform_coarse = build_uniform_map(pts, cell_m=1.0)
+        near = np.hypot(adaptive.cx, adaptive.cy) < 10.0
+        assert near.sum() > (np.hypot(uniform_coarse.cx, uniform_coarse.cy) < 10.0).sum()
+
+    def test_config_wrapper_matches_the_direct_call(self, config):
+        pts = make_points([0.1, 15.0, 40.0], [0.1, 15.0, 40.0], [0.0, 1.0, 2.0], [7, 13, 41])
+        via_cfg = build_adaptive_map_from_config(pts, config.grid)
+        direct = build_adaptive_map(
+            pts,
+            zones=config.grid.zones,
+            min_points_per_cell=config.grid.min_points_per_cell,
+            elevation_stat=config.grid.elevation_stat,
+        )
+        assert len(via_cfg) == len(direct)
+        assert list(via_cfg.zone) == list(direct.zone)
+
+
+class TestUncoveredPointCount:
+    def test_zero_when_every_point_falls_inside_some_zone(self):
+        pts = make_points([1.0, 15.0], [0.0, 0.0], [0.0, 0.0], [7, 7])
+        assert uncovered_point_count(pts, TWO_ZONES) == 0
+
+    def test_counts_points_beyond_the_outermost_zone(self):
+        pts = make_points([1.0, 15.0, 500.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [7, 7, 7])
+        assert uncovered_point_count(pts, TWO_ZONES) == 1
+
+    def test_empty_points_is_zero_not_an_error(self):
+        pts = make_points([], [], [], [])
+        assert uncovered_point_count(pts, TWO_ZONES) == 0
+
+    def test_the_shipped_default_config_leaves_nothing_uncovered(self, config):
+        # The zone ladder's outer edge is designed to match max_range_m.
+        pts = make_points([1.0, 50.0, 99.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [7, 7, 7])
+        assert uncovered_point_count(pts, config.grid.zones) == 0
+
+
+@pytest.mark.slow
+class TestAdaptiveGridOnRealData:
+    """Regression pins against the real dataset, measured by this suite itself."""
+
+    def test_frame_zero_matches_the_measured_reduction(self, real_sequence, config):
+        from avrmap.frames import load_frame
+        from avrmap.preprocess import preprocess_frame
+
+        frame = load_frame(real_sequence, "00")
+        pre = preprocess_frame(frame, config.preprocess)
+        adaptive = build_adaptive_map_from_config(pre, config.grid)
+        fine = build_uniform_map(
+            pre, cell_m=config.grid.finest_cell_m,
+            min_points_per_cell=config.grid.min_points_per_cell,
+            elevation_stat=config.grid.elevation_stat,
+        )
+
+        assert len(adaptive) == 27_295
+        assert len(fine) == 63_611
+        reduction = 1 - len(adaptive) / len(fine)
+        assert reduction == pytest.approx(0.571, abs=0.01)
+
+        assert uncovered_point_count(pre, config.grid.zones) == 0
+        assert int(adaptive.n_points.sum()) == pre.n_kept
+        assert np.isfinite(adaptive.z_ref).all()
+        assert (adaptive.sem_conf > 0).all() and (adaptive.sem_conf <= 1.0).all()
+
+    def test_adaptive_beats_uniform_fine_on_every_frame(self, real_sequence, config):
+        """The plan's central, falsifiable claim, checked on the full sequence."""
+        from avrmap.frames import load_frame
+        from avrmap.preprocess import preprocess_frame
+
+        worst_ratio = 0.0
+        for frame_id in real_sequence.frame_ids:
+            frame = load_frame(real_sequence, frame_id)
+            pre = preprocess_frame(frame, config.preprocess)
+            adaptive = build_adaptive_map_from_config(pre, config.grid)
+            fine = build_uniform_map(
+                pre, cell_m=config.grid.finest_cell_m,
+                min_points_per_cell=config.grid.min_points_per_cell,
+                elevation_stat=config.grid.elevation_stat,
+            )
+            assert len(adaptive) < len(fine), f"frame {frame_id}: adaptive did not beat uniform_fine"
+            worst_ratio = max(worst_ratio, len(adaptive) / len(fine))
+        # a loose bound: even the least favourable frame should still show a
+        # real reduction, not a near-tie
+        assert worst_ratio < 0.7

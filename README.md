@@ -19,7 +19,7 @@ estimated.
 | --- | --- |
 | 1. Data foundation and validation | **done** |
 | 2. Preprocessing and uniform grid | **done** |
-| 3. Adaptive grid | not started |
+| 3. Adaptive grid | **done** |
 | 4. Benchmark harness | not started |
 | 5. Dashboard | not started |
 | 6. Playback | not started |
@@ -48,8 +48,9 @@ Then validate the dataset and run the tests:
 python scripts/validate_dataset.py          # checks all 80 frames, about 1.5 s
 python scripts/validate_dataset.py --quick  # first, middle and last frame only
 python scripts/build_uniform_map.py         # preprocess + grid one frame, print a summary
-python -m pytest -q                         # full suite
-python -m pytest -q -m "not slow"           # skip tests that read the real data
+python scripts/compare_grids.py             # uniform vs. adaptive on one frame
+python -m pytest -q                         # full suite, about 30 s
+python -m pytest -q -m "not slow"           # skip tests that read the real data, about 1 s
 ```
 
 `streamlit` pins `pandas<3` in every release before 1.63.0, so `requirements.txt` pins
@@ -180,8 +181,9 @@ rationale. **These are defensible defaults, not a validated optimum.** They live
 `configs/default.yaml` and are meant to be changed.
 
 The same prototype measured 27,400 adaptive cells against 63,749 for a uniform 0.1 m grid on
-the same points, a 57% reduction at identical near-field resolution. Milestone 4 will
-reproduce that properly across all 80 frames, with all default filtering applied.
+the same points, a 57% reduction at identical near-field resolution. Milestone 3 reproduces
+that through the full pipeline with default filtering applied, and across every frame — see
+below.
 
 ---
 
@@ -209,9 +211,9 @@ loop over points anywhere in it:
   `count * 256 - class_id`, is reduced per cell with `np.maximum.reduceat`: a strictly higher
   count always wins, and equal counts resolve to the lower class id, deterministically.
 
-Both grid types call this kernel through `avrmap/grids/uniform.py`, which fixes `zone_id=0`
-and one cell size for the whole range — the adaptive grid in Milestone 3 will call it once per
-zone and concatenate the results with `CellTable.concat`.
+`avrmap/grids/uniform.py` calls this kernel once, with `zone_id=0` and one cell size for the
+whole range. `avrmap/grids/adaptive.py` (below) calls it once per zone and concatenates the
+results with `CellTable.concat`.
 
 Measured on frame 00 through the full pipeline, default config (range crop, class and device
 filters, elevation crop all applied):
@@ -228,6 +230,63 @@ z-range, mean confidence and a per-class cell breakdown, for any frame.
 
 ---
 
+## The adaptive grid
+
+`avrmap/grids/adaptive.py` builds the foveated grid. Because the map frame only translates to
+the ego position and never rotates (see Coordinate frames, above), a point's distance zone
+depends on its planar radius alone — no heading, no per-zone geometry beyond a radius test.
+`build_adaptive_map` loops over the configured zones, masks each zone's points by
+`ZoneConfig.contains` (the half-open `[r_min, r_max)` test the config validator already
+enforces to be gap-free and non-overlapping), calls `aggregate_cells` once per zone at that
+zone's own cell size, and concatenates the per-zone `CellTable`s. `zone_id` on each output cell
+is the zone's index, so results can always be traced back to the config.
+
+A point can in principle fall outside every zone, if the zone ladder's outer edge is
+configured narrower than `preprocess.max_range_m`. `uncovered_point_count` reports that count
+explicitly rather than letting it disappear silently; for the shipped default config the two
+match exactly, so it is always zero.
+
+Measured on frame 00 through the full pipeline, default four-zone config, against a uniform
+grid at the same 0.1 m finest resolution:
+
+| Grid | Cells | Table memory |
+| --- | --- | --- |
+| `uniform_fine` (0.1 m everywhere) | 63,611 | 2112.1 KiB |
+| adaptive (4 zones, 0.1-0.8 m) | 27,295 | 906.3 KiB |
+
+That is a **57.1% cell reduction**, matching the 57% measured during planning, now produced by
+the real pipeline with default filtering applied. Near-field resolution is preserved: within
+the innermost 10 m zone, the adaptive grid has 3,348 cells against the uniform grid's 3,324 —
+matching within rounding, since a circular radius cutoff clips each grid's square cells
+slightly differently at the boundary. Point count is exactly conserved across zones (166,327
+in, 166,327 aggregated), confirming no point is double-counted or silently lost at a zone
+boundary.
+
+The reduction holds on every one of the 80 frames, not just frame 00 — `test_grids.py` asserts
+`len(adaptive) < len(uniform_fine)` across the full sequence, with the worst frame still at
+less than half the uniform cell count. This is the central, falsifiable claim of the project,
+checked directly rather than assumed from one frame.
+
+`python scripts/compare_grids.py` reproduces the full comparison for any frame, including the
+per-zone cell and point breakdown:
+
+```
+grid                             cells      time   mean pts/cell
+uniform_fine (0.1 m)            63,611     59.3ms             2.6
+uniform_coarse (0.8 m)           6,573     44.2ms            25.3
+adaptive (4 zones)              27,295     51.2ms             6.1
+
+adaptive vs uniform_fine     57.1% fewer cells   [measured]
+adaptive vs uniform_fine    906.3 KiB vs 2112.1 KiB table memory   [measured]
+```
+
+This script is a one-frame sanity check, not the benchmark. Milestone 4 turns the same
+building blocks into a proper multi-baseline (`uniform_fine`, `uniform_matched`,
+`uniform_coarse`), multi-frame benchmark with elevation-error and semantic-agreement quality
+metrics, written to `results/benchmark.csv`.
+
+---
+
 ## Layout
 
 ```
@@ -240,7 +299,8 @@ avrmap/          processing library, no UI imports anywhere
   preprocess.py    range/height crop, class and device filtering
   grids/
     common.py        CellTable and the aggregate_cells kernel
-    uniform.py       the uniform-resolution grid (milestone 3 adds adaptive.py)
+    uniform.py       the uniform-resolution grid
+    adaptive.py      the foveated grid: per-zone cell sizes, concatenated
 app/             Streamlit dashboard (milestone 5)
 scripts/         command-line entry points
 configs/         default.yaml
@@ -265,9 +325,15 @@ failure modes there: unpaired frames, row-count mismatches, missing columns, und
 labels, wrong pose counts. Tests marked `slow` read the actual dataset and skip cleanly when
 it is absent.
 
-87 tests total. `test_preprocess.py` covers each filter in isolation plus their overlap.
+95 tests total. `test_preprocess.py` covers each filter in isolation plus their overlap.
 `test_grids.py` covers the aggregation kernel with hand-computable answers (a flat plane, a
 dense square of known side and resolution, elevation statistics on `0..99`, semantic
-tie-breaking, `min_points_per_cell` filtering, `CellTable.concat`) and pins the real frame-00
-cell count at 0.1 m (63,611) as a regression guard, produced by the suite itself rather than
-assumed in advance.
+tie-breaking, `min_points_per_cell` filtering, `CellTable.concat`), the adaptive grid's zone
+assignment (boundary handling, per-zone cell size, point conservation, skipped-empty-zone,
+`uncovered_point_count`), and pins two real-data regressions: the frame-00 cell count at 0.1 m
+(63,611) and the frame-00 adaptive-vs-uniform comparison (27,295 cells, a 57.1% reduction).
+The full 80-frame `adaptive < uniform_fine` check — the project's central claim — is itself a
+test, not just a script output, and is the slowest thing in the suite at about 15 s.
+
+The full suite takes about 30 s; `-m "not slow"` skips every dataset-backed test and finishes
+in about 1 s, useful while iterating on code that doesn't touch the real files.
