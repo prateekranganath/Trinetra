@@ -20,7 +20,7 @@ estimated.
 | 1. Data foundation and validation | **done** |
 | 2. Preprocessing and uniform grid | **done** |
 | 3. Adaptive grid | **done** |
-| 4. Benchmark harness | not started |
+| 4. Benchmark harness | **done** |
 | 5. Dashboard | not started |
 | 6. Playback | not started |
 | 7. Multi-frame accumulation and demo | not started |
@@ -49,6 +49,7 @@ python scripts/validate_dataset.py          # checks all 80 frames, about 1.5 s
 python scripts/validate_dataset.py --quick  # first, middle and last frame only
 python scripts/build_uniform_map.py         # preprocess + grid one frame, print a summary
 python scripts/compare_grids.py             # uniform vs. adaptive on one frame
+python scripts/run_benchmark.py             # full benchmark, all 80 frames, a few minutes
 python -m pytest -q                         # full suite, about 30 s
 python -m pytest -q -m "not slow"           # skip tests that read the real data, about 1 s
 ```
@@ -280,10 +281,88 @@ adaptive vs uniform_fine     57.1% fewer cells   [measured]
 adaptive vs uniform_fine    906.3 KiB vs 2112.1 KiB table memory   [measured]
 ```
 
-This script is a one-frame sanity check, not the benchmark. Milestone 4 turns the same
-building blocks into a proper multi-baseline (`uniform_fine`, `uniform_matched`,
-`uniform_coarse`), multi-frame benchmark with elevation-error and semantic-agreement quality
-metrics, written to `results/benchmark.csv`.
+This script is a one-frame sanity check, not the benchmark — see the next section.
+
+---
+
+## The benchmark harness
+
+`scripts/run_benchmark.py` runs four methods per frame across the whole sequence and writes
+`results/benchmark.csv` (one row per frame per method) and `results/benchmark_summary.json`
+(the same data aggregated across frames). Every column is labelled measured or derived in
+`avrmap/metrics.py`'s docstrings; nothing is filled in from an earlier run.
+
+**Three uniform baselines**, not one, because a single baseline is easy to rig:
+
+- `uniform_fine` — uniform at the adaptive grid's finest cell size (0.1 m). The primary *cost*
+  baseline: adaptive gives identical near-field resolution, so any cell saving here is real.
+- `uniform_matched` — a uniform cell size found by bisection (`find_matching_uniform_cell_size`
+  in `avrmap/grids/uniform.py`) so its cell count lands close to the adaptive grid's for that
+  frame. The primary *quality* baseline: at an equal cell budget, does adaptive spend its cells
+  where they matter? Occupied-cell count is a non-increasing function of cell size for a fixed
+  point cloud, which is what makes bisection valid here; the search runs up to 14 full grid
+  builds per frame and reports the cell size and count it actually found, not an assumed exact
+  match.
+- `uniform_coarse` — uniform at the coarsest configured zone size (0.8 m). A floor reference.
+
+**Quality is scored directly against the frame's own points**, so no synthetic ground truth is
+needed. `avrmap/grids/common.py`'s `aggregate_cells` gained a `return_point_cells` option that
+maps every input point to the row of the output table it landed in (or -1 if that cell was
+dropped), entirely vectorized — a stable sort's inverse permutation, no Python loop over
+points. `avrmap/metrics.py`'s `quality_by_band` then computes, per distance band:
+
+- **Elevation RMSE** — root-mean-square `|point.z - cell.z_ref|` over matched points.
+- **Semantic agreement** — the fraction of matched points whose own class equals their cell's
+  majority class.
+
+Bands are the same four edges as the zone ladder (`0, 10, 30, 60, 100` m), so the
+"near-field" comparison is exact, not approximate.
+
+### Results, full sequence, 80 frames
+
+| Method | Mean cells | vs `uniform_fine` | Mean build time | Mean table memory |
+| --- | --- | --- | --- | --- |
+| `uniform_fine` (0.1 m) | 49,788 | — | 91.5 ms | 1,653 KiB |
+| `uniform_matched` (~0.1-0.9 m, searched per frame) | 22,425 | 55.0% fewer | 83.3 ms | 745 KiB |
+| `uniform_coarse` (0.8 m) | 5,408 | 89.1% fewer | 72.3 ms | 180 KiB |
+| **adaptive** (4 zones) | **22,436** | **54.9% fewer** | 73.1 ms | 745 KiB |
+
+`uniform_matched` and adaptive land within 11 cells of each other on average — the search does
+its job — which makes the 0-10 m band comparison below an honest equal-budget test:
+
+| Method | RMSE, 0-10 m | Semantic agreement, 0-10 m |
+| --- | --- | --- |
+| `uniform_fine` | 0.512 m | 0.981 |
+| **adaptive** | **0.512 m** | **0.981** |
+| `uniform_matched` | 0.582 m | 0.969 |
+| `uniform_coarse` | 0.706 m | 0.938 |
+
+This is the plan's central, falsifiable claim, now checked on the full sequence rather than one
+frame: **adaptive matches `uniform_fine` almost exactly in the near band while using 55% fewer
+cells overall, and clearly beats `uniform_matched` in that same band at essentially the same
+cell budget.**
+
+The honest trade-off shows up further out. Because adaptive tapers to 0.8 m cells beyond 60 m
+while `uniform_matched` spreads its budget evenly at roughly 0.24 m everywhere, adaptive is
+*less* accurate than `uniform_matched` in the 60-100 m band (RMSE 3.06 m vs 2.37 m, agreement
+0.983 vs 0.995). Concentrating resolution near the ego is a deliberate choice for a driving
+context where nearby geometry matters more, not a free win in every band — the zone ladder
+trades distant accuracy for near-field detail and a smaller overall footprint, and the
+benchmark reports that trade honestly rather than only in the band that flatters it.
+
+**What's measured, derived, or unavailable**, per the plan's requirement to distinguish them:
+
+| Metric | Status |
+| --- | --- |
+| Cell counts, build time, table memory | measured |
+| Dense-equivalent cell count | derived (no dense array is ever built) |
+| Cell reduction percentages | derived from two measured counts |
+| Elevation RMSE, semantic agreement | measured, against the frame's own points |
+| `build_only_fps_estimate` (e.g. adaptive: 13.7, `uniform_fine`: 10.9) | derived from build time alone; excludes frame load, preprocessing, and all rendering |
+| Render / UI FPS | **unavailable** — no dashboard exists yet (Milestone 5); reported as such in `benchmark_summary.json`, never estimated |
+
+Reproduce with `python scripts/run_benchmark.py` (a few minutes for all 80 frames), or
+`--frames 10` / `--frames 00,10,20` for a quicker pass while iterating.
 
 ---
 
@@ -298,14 +377,15 @@ avrmap/          processing library, no UI imports anywhere
   semantics.py     class names, groups, colour palette
   preprocess.py    range/height crop, class and device filtering
   grids/
-    common.py        CellTable and the aggregate_cells kernel
-    uniform.py       the uniform-resolution grid
+    common.py        CellTable, aggregate_cells, and its point-to-cell map
+    uniform.py       the uniform grid, and the uniform_matched cell-size search
     adaptive.py      the foveated grid: per-zone cell sizes, concatenated
+  metrics.py       build-time timing, dense-equivalent memory, per-band quality
 app/             Streamlit dashboard (milestone 5)
-scripts/         command-line entry points
+scripts/         command-line entry points, including run_benchmark.py
 configs/         default.yaml
 tests/           pytest suite, mirrors the module names
-results/         generated benchmark output
+results/         benchmark.csv and benchmark_summary.json
 cache/           generated frame cache
 ```
 
@@ -325,15 +405,19 @@ failure modes there: unpaired frames, row-count mismatches, missing columns, und
 labels, wrong pose counts. Tests marked `slow` read the actual dataset and skip cleanly when
 it is absent.
 
-95 tests total. `test_preprocess.py` covers each filter in isolation plus their overlap.
+131 tests total. `test_preprocess.py` covers each filter in isolation plus their overlap.
 `test_grids.py` covers the aggregation kernel with hand-computable answers (a flat plane, a
 dense square of known side and resolution, elevation statistics on `0..99`, semantic
-tie-breaking, `min_points_per_cell` filtering, `CellTable.concat`), the adaptive grid's zone
-assignment (boundary handling, per-zone cell size, point conservation, skipped-empty-zone,
-`uncovered_point_count`), and pins two real-data regressions: the frame-00 cell count at 0.1 m
-(63,611) and the frame-00 adaptive-vs-uniform comparison (27,295 cells, a 57.1% reduction).
-The full 80-frame `adaptive < uniform_fine` check — the project's central claim — is itself a
-test, not just a script output, and is the slowest thing in the suite at about 15 s.
+tie-breaking, `min_points_per_cell` filtering, `CellTable.concat`), the point-to-cell mapping
+(`return_point_cells`), the adaptive grid's zone assignment (boundary handling, per-zone cell
+size, point conservation, skipped-empty-zone, `uncovered_point_count`), and
+`find_matching_uniform_cell_size`'s bisection search — plus real-data regressions for the
+frame-00 cell count, the frame-00 adaptive-vs-uniform comparison, and the full 80-frame
+`adaptive < uniform_fine` claim (the slowest thing in the suite, about 15 s). `test_metrics.py`
+hand-verifies `quality_by_band`'s RMSE and agreement formulas, including unmatched points and
+empty bands. `test_run_benchmark.py` runs the benchmark CLI end to end on two frames and checks
+the CSV and summary it produces are structurally sound — the full 80-frame run itself is left
+to `python scripts/run_benchmark.py`, not the test suite, since it takes a few minutes.
 
 The full suite takes about 30 s; `-m "not slow"` skips every dataset-backed test and finishes
 in about 1 s, useful while iterating on code that doesn't touch the real files.

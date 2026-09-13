@@ -119,7 +119,8 @@ def aggregate_cells(
     zone_id: int = 0,
     min_points_per_cell: int = 1,
     elevation_stat: str = "p95",
-) -> CellTable:
+    return_point_cells: bool = False,
+) -> CellTable | tuple[CellTable, np.ndarray]:
     """Bin points into square cells of ``cell_size`` and aggregate each cell.
 
     This is the single aggregation kernel shared by the uniform and adaptive
@@ -151,10 +152,16 @@ def aggregate_cells(
             unreliable.
         elevation_stat: One of ``"p95"``, ``"max"``, ``"mean"``, ``"min"``,
             selecting what ``z_ref`` reports.
+        return_point_cells: When True, also return a ``(N,)`` int64 array
+            mapping each input point to its row in the returned table, or -1
+            if that point's cell was dropped by ``min_points_per_cell``. Used
+            by :mod:`avrmap.metrics` to score elevation and semantic quality
+            directly against the points a grid was built from.
 
     Returns:
         A :class:`CellTable` with one row per surviving occupied cell, sorted
-        by cell key (i.e. by ix then iy).
+        by cell key (i.e. by ix then iy). If ``return_point_cells`` is True,
+        a ``(table, point_row)`` tuple instead.
     """
     if cell_size <= 0:
         raise ValueError(f"cell_size must be positive, got {cell_size}")
@@ -165,6 +172,8 @@ def aggregate_cells(
         )
     n = x.shape[0]
     if n == 0:
+        if return_point_cells:
+            return CellTable.empty(), np.zeros(0, dtype=np.int64)
         return CellTable.empty()
 
     ix = np.floor(x / cell_size).astype(np.int64)
@@ -236,7 +245,7 @@ def aggregate_cells(
 
     keep = n_points >= min_points_per_cell
     n_kept = int(keep.sum())
-    return CellTable(
+    table = CellTable(
         cx=cx[keep],
         cy=cy[keep],
         size=np.full(n_kept, cell_size, dtype=np.float32),
@@ -248,3 +257,17 @@ def aggregate_cells(
         sem_class=sem_class[keep],
         sem_conf=sem_conf[keep],
     )
+    if not return_point_cells:
+        return table
+
+    # Map each original point to its row in `table`, or -1 if its cell did not
+    # survive min_points_per_cell. `row_of_unique` gives each *unique* cell
+    # (pre-filter, same order as `cells`/`counts`) its post-filter row, via a
+    # running count of kept cells so far; np.repeat then broadcasts that back
+    # out to one entry per point in (cell, z)-sorted order, and a scatter
+    # through `elev_order` restores the caller's original point order.
+    row_of_unique = np.where(keep, np.cumsum(keep) - 1, -1)
+    row_per_sorted_point = np.repeat(row_of_unique, counts)
+    point_row = np.empty(n, dtype=np.int64)
+    point_row[elev_order] = row_per_sorted_point
+    return table, point_row

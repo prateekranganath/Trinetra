@@ -13,10 +13,16 @@ from avrmap.config import ZoneConfig
 from avrmap.grids.adaptive import (
     build_adaptive_map,
     build_adaptive_map_from_config,
+    build_adaptive_map_with_point_cells,
     uncovered_point_count,
 )
 from avrmap.grids.common import CellTable, aggregate_cells
-from avrmap.grids.uniform import build_uniform_map, build_uniform_map_from_config
+from avrmap.grids.uniform import (
+    build_uniform_map,
+    build_uniform_map_from_config,
+    build_uniform_map_with_point_cells,
+    find_matching_uniform_cell_size,
+)
 from avrmap.preprocess import PreprocessedPoints
 
 
@@ -165,6 +171,48 @@ class TestMinPointsPerCell:
         assert len(t) == 2
 
 
+class TestPointToCellMapping:
+    """``aggregate_cells(..., return_point_cells=True)``, the mapping the
+    quality metrics rely on to score a grid against its own input points."""
+
+    def test_default_call_is_unaffected_and_returns_only_the_table(self):
+        t = cell([0.1], [0.1], [1.0], [7], cell_size=1.0)
+        assert isinstance(t, CellTable)
+
+    def test_points_in_the_same_cell_map_to_the_same_row(self):
+        t, row = cell(
+            [0.1, 0.1, 0.1, 1.5, 1.5], [0.1, 0.1, 0.1, 1.5, 1.5],
+            [1.0, 2.0, 3.0, 5.0, 6.0], [7, 7, 13, 41, 41],
+            cell_size=1.0, return_point_cells=True,
+        )
+        assert row[0] == row[1] == row[2]
+        assert row[3] == row[4]
+        assert row[0] != row[3]
+
+    def test_n_points_reconstructed_from_the_mapping_matches_the_table(self):
+        t, row = cell(
+            [0.1, 0.1, 0.1, 1.5, 1.5], [0.1, 0.1, 0.1, 1.5, 1.5],
+            [1.0, 2.0, 3.0, 5.0, 6.0], [7, 7, 13, 41, 41],
+            cell_size=1.0, return_point_cells=True,
+        )
+        recon = np.bincount(row, minlength=len(t))
+        assert np.array_equal(recon, t.n_points)
+
+    def test_points_in_a_dropped_cell_map_to_negative_one(self):
+        # cell A: 2 points (survives); cell B: 1 point (dropped)
+        t, row = cell(
+            [0.1, 0.1, 1.5], [0.1, 0.1, 1.5], [1.0, 2.0, 3.0], [7, 7, 13],
+            cell_size=1.0, min_points_per_cell=2, return_point_cells=True,
+        )
+        assert len(t) == 1
+        assert row[0] == 0 and row[1] == 0 and row[2] == -1
+
+    def test_empty_input_returns_an_empty_mapping(self):
+        t, row = cell([], [], [], [], cell_size=1.0, return_point_cells=True)
+        assert len(t) == 0
+        assert row.shape == (0,)
+
+
 class TestCellTable:
     def test_concat_stacks_rows_and_preserves_totals(self):
         a = cell([0.1], [0.1], [1.0], [7], cell_size=1.0, zone_id=0)
@@ -237,6 +285,67 @@ class TestUniformGrid:
         )
         assert len(via_cfg) == len(direct)
         assert via_cfg.size[0] == direct.size[0]
+
+    def test_with_point_cells_variant_returns_the_same_table(self):
+        pts = self._points([0.1, 5.1], [0.1, 5.1], [0.0, 1.0], [7, 13])
+        table, row = build_uniform_map_with_point_cells(pts, cell_m=1.0)
+        plain = build_uniform_map(pts, cell_m=1.0)
+        assert len(table) == len(plain)
+        assert list(table.cx) == list(plain.cx)
+
+    def test_with_point_cells_every_point_is_matched(self):
+        # A uniform grid has no zone-coverage concept, so with the default
+        # min_points_per_cell=1 nothing should ever come back unmatched.
+        rng = np.random.default_rng(2)
+        n = 500
+        x, y = rng.uniform(-20, 20, n), rng.uniform(-20, 20, n)
+        pts = self._points(x, y, np.zeros(n), np.full(n, 7))
+        table, row = build_uniform_map_with_point_cells(pts, cell_m=0.5)
+        assert (row >= 0).all()
+        assert np.array_equal(np.bincount(row, minlength=len(table)), table.n_points)
+
+
+class TestFindMatchingUniformCellSize:
+    def _points(self, n=4000, extent=40.0, seed=7):
+        rng = np.random.default_rng(seed)
+        x, y = rng.uniform(-extent, extent, n), rng.uniform(-extent, extent, n)
+        return TestUniformGrid._points(x, y, np.zeros(n), np.full(n, 7))
+
+    def test_finds_a_cell_size_close_to_the_target(self):
+        pts = self._points()
+        fine = build_uniform_map(pts, cell_m=0.1)
+        target = len(fine) // 2
+        size, cells = find_matching_uniform_cell_size(pts, target_cells=target, iterations=14)
+        assert size > 0.1  # coarser than the fine grid, since target < len(fine)
+        # bisection with 14 iterations over a 0.01-5.0 m range should easily
+        # land within a couple of percent of the target cell count
+        assert abs(cells - target) / target < 0.05
+
+    def test_returned_size_actually_produces_the_returned_cell_count(self):
+        pts = self._points()
+        size, cells = find_matching_uniform_cell_size(pts, target_cells=200, iterations=10)
+        assert len(build_uniform_map(pts, cell_m=size)) == cells
+
+    def test_rejects_non_positive_target(self):
+        pts = self._points(n=10)
+        with pytest.raises(ValueError, match="target_cells"):
+            find_matching_uniform_cell_size(pts, target_cells=0)
+
+    def test_rejects_an_inverted_search_range(self):
+        pts = self._points(n=10)
+        with pytest.raises(ValueError, match="lo_m"):
+            find_matching_uniform_cell_size(pts, target_cells=10, lo_m=2.0, hi_m=1.0)
+
+    def test_a_target_outside_the_achievable_range_clips_without_error(self):
+        # A dense cloud keeps cell count genuinely non-increasing in cell
+        # size, so an absurdly large target should drive the search to (or
+        # very near) the finest allowed bound.
+        pts = self._points(n=4000, extent=40.0)
+        size, cells = find_matching_uniform_cell_size(
+            pts, target_cells=10**9, lo_m=0.5, hi_m=5.0, iterations=8
+        )
+        assert size < 0.6
+        assert cells == len(build_uniform_map(pts, cell_m=size))
 
 
 @pytest.mark.slow
@@ -358,6 +467,31 @@ class TestAdaptiveGrid:
         )
         assert len(via_cfg) == len(direct)
         assert list(via_cfg.zone) == list(direct.zone)
+
+    def test_with_point_cells_maps_every_matched_point_and_conserves_counts(self):
+        rng = np.random.default_rng(6)
+        n = 800
+        angle = rng.uniform(0, 2 * np.pi, n)
+        radius = rng.uniform(0, 19.9, n)
+        x, y = radius * np.cos(angle), radius * np.sin(angle)
+        pts = make_points(x, y, np.zeros(n), np.full(n, 7))
+        table, row = build_adaptive_map_with_point_cells(pts, TWO_ZONES)
+        assert (row >= 0).all()  # every point sits inside one of the two zones
+        assert np.array_equal(np.bincount(row, minlength=len(table)), table.n_points)
+
+    def test_with_point_cells_marks_uncovered_points_as_unmatched(self):
+        pts = make_points([1.0, 500.0], [0.0, 0.0], [0.0, 0.0], [7, 7])
+        table, row = build_adaptive_map_with_point_cells(pts, TWO_ZONES)
+        assert row[0] >= 0
+        assert row[1] == -1
+
+    def test_with_point_cells_drops_a_sparse_cell_to_unmatched(self):
+        # Only one point in the whole 10-20 m zone, which min_points_per_cell=2
+        # should drop, leaving that point's row at -1.
+        pts = make_points([1.0, 1.0, 15.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [7, 7, 13])
+        table, row = build_adaptive_map_with_point_cells(pts, TWO_ZONES, min_points_per_cell=2)
+        assert row[0] >= 0 and row[1] >= 0
+        assert row[2] == -1
 
 
 class TestUncoveredPointCount:
