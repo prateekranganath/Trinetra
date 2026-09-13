@@ -22,7 +22,7 @@ estimated.
 | 3. Adaptive grid | **done** |
 | 4. Benchmark harness | **done** |
 | 5. Dashboard | **done** |
-| 6. Playback | not started |
+| 6. Playback and live controls | **done** |
 | 7. Multi-frame accumulation and demo | not started |
 
 ---
@@ -360,7 +360,7 @@ benchmark reports that trade honestly rather than only in the band that flatters
 | Cell reduction percentages | derived from two measured counts |
 | Elevation RMSE, semantic agreement | measured, against the frame's own points |
 | `build_only_fps_estimate` (e.g. adaptive: 13.7, `uniform_fine`: 10.9) | derived from build time alone; excludes frame load, preprocessing, and all rendering |
-| Render / UI FPS | **unavailable** — the dashboard (below) has no playback loop yet to time; Milestone 6 measures actual Streamlit rerun latency instead of estimating it |
+| Render / UI FPS | **unavailable from this CLI** — it renders nothing to time. The dashboard (below) reports its own measured UI rate from actual Streamlit rerun intervals during playback, which is a different, honestly-measured number, not filled in here |
 
 Reproduce with `python scripts/run_benchmark.py` (a few minutes for all 80 frames), or
 `--frames 10` / `--frames 00,10,20` for a quicker pass while iterating.
@@ -376,10 +376,11 @@ already has, so neither file duplicates logic that belongs in `avrmap`.
 
 **Sidebar.** Sequence selector (one sequence today; the dropdown works for more without any
 code change, since discovery is already multi-sequence-capable). Frame selection by slider or
-Prev/Next buttons. A dataset-status expander running the same validation from Milestone 1.
-Display controls for the 3D point cap and which semantic groups to show. Read-only expanders
-listing the current zone ladder and preprocessing filters — read-only because live-editable
-zone and filter controls that trigger a rebuild are Milestone 6's job, not this one's.
+Prev/Next buttons. Play/Pause autoplay with a target rate and an honestly *measured* UI rate
+(below). A dataset-status expander running the same validation from Milestone 1. Display
+controls for the 3D point cap and which semantic groups to show. Live, validated editors for
+the zone ladder and the preprocessing filters, both of which actually rebuild the grids rather
+than only filtering the display — see below.
 
 **Tabs.**
 
@@ -400,6 +401,45 @@ zone and filter controls that trigger a rebuild are Milestone 6's job, not this 
   frame. Below that, the full 80-frame `results/benchmark_summary.json` is shown for reference
   when present, with an `st.info` pointing at `run_benchmark.py` when it isn't.
 
+**Playback, and a measured UI rate rather than an assumed one.** Play sets a
+`playing` flag; after every tab renders, the dashboard sleeps to a target interval and calls
+`st.rerun()`, which is the standard Streamlit pattern for this — clicking Pause is processed
+before the script reruns from the top (an `on_click` callback, not a same-run inline check; see
+below), so it takes effect on the very next tick rather than lagging by one frame. Every actual
+gap between reruns is recorded, and the sidebar reports the mean of the last 20 as "Measured UI
+rate" — the true cost of loading, preprocessing, gridding, and rendering every tab at whatever
+the live zone and filter settings currently are, not a number computed once and assumed to
+hold. This is what fills the "Render / UI FPS: unavailable" gap the benchmark harness
+(Milestone 4) left open, since the CLI benchmark has no UI to time.
+
+**A stale-button bug the fix is worth naming.** Streamlit evaluates a button's `disabled=`
+condition at the moment it's drawn, in top-to-bottom script order — so checking a click inline
+(`if col_prev.button(...):`) means that when Next is clicked, Prev (drawn first, from the
+frame index *before* this click's effect) renders disabled for that one page, and a real
+browser user genuinely cannot click it, not just an artifact of testing. `streamlit.testing.v1.AppTest`
+caught this directly (`Cannot update a disabled button widget`) when a test clicked Next then
+immediately tried Prev. The fix uses `on_click` callbacks instead: the callback mutates
+`st.session_state` *before* the script reruns from the top, so `disabled=` sees the post-click
+state. All four Prev/Next/Play/Pause buttons use this pattern now.
+
+**The zone editor.** Each zone's `r_max` and cell size are editable (`r_min` is derived from the
+previous zone's `r_max`, so contiguity can't be broken by the UI); `r_min`/`r_max`/`cell_m`
+combine into a fresh `ZoneConfig` tuple and are checked with `avrmap.config.validate_zones` —
+the exact function `load_config` itself uses, now public for this reason — before anything is
+rebuilt. An edit that fails validation (say, a cell size that shrinks going outward) shows the
+precise `ConfigError` message and the dashboard keeps rendering with the last valid ladder,
+rather than crashing or silently accepting a broken configuration. Zone *count* stays fixed at
+whatever the config specifies; adding or removing a zone isn't supported by the UI.
+
+**The filter editor.** Range crop, height crop, dropped classes, and kept devices are all live
+sliders and multiselects that feed a fresh `PreprocessConfig` into the same
+`get_frame_bundle` cache function used everywhere else — an edit here really does reprocess the
+frame and rebuild both grids, unlike the point-cloud tab's semantic-group filter, which stays
+display-only on purpose (it doesn't need a rebuild, so it doesn't pay for one). Narrowing the
+filters to zero surviving points shows a plain warning instead of an empty, confusing set of
+tabs. A "Reset zones and filters to config defaults" button clears every edited widget back to
+the shipped `configs/default.yaml` values.
+
 **Rasterizing a sparse grid into an image.** `avrmap/render.py` paints a `CellTable` into a
 fixed-size array — a rendering device, never the storage format, exactly as the technical plan
 specifies. Cells sharing an edge length (every cell in a uniform grid; every cell in one
@@ -410,21 +450,34 @@ make a dashboard rerun slow — the cap only coarsens the *picture*, never the u
 `CellTable` or any measurement taken from it.
 
 **Caching.** `st.cache_resource` covers dataset discovery and validation (per session, rarely
-invalidated); `st.cache_data` covers the per-frame load-preprocess-and-grid bundle, keyed on the
-config path, sequence id, and frame id — three plain strings, deliberately, rather than the
-dataclasses those resolve to, since Streamlit's hashing of custom objects is a needless risk to
-take when reloading a config and re-globbing a directory costs a few milliseconds anyway.
+invalidated); `st.cache_data` covers the per-frame load-preprocess-and-grid bundle, now keyed on
+every editable value (config path, sequence id, frame id, the range/height/class/device filter
+settings, and the zone ladder as a tuple of plain `(r_min, r_max, cell_m)` tuples) — deliberately
+primitives throughout, rather than the dataclasses those resolve to, since Streamlit's hashing
+of custom objects is a needless risk when reconstructing them costs a few milliseconds anyway.
+This also means every live edit is automatically part of the cache key with no extra
+bookkeeping: stepping back to a frame/filter/zone combination already seen in this session is
+instant.
 
 **Testing the dashboard.** Streamlit's UI cannot be driven by ordinary pytest assertions on
 pixels, so `app/dashboard.py` is smoke-tested with `streamlit.testing.v1.AppTest`, which runs
 the actual script headlessly and surfaces any Python exception it raises. Verified this way,
-without a single exception: the initial render (all four tabs, thirteen sidebar elements), the
-Prev/Next buttons at both sequence boundaries (frame 0 and frame 79), the frame slider jumped
-to an arbitrary and to the last frame, the semantic-group multiselect cleared to empty, the
-point-count number input changed, the sequence selectbox re-selected, and — the most expensive
-combined path — the `uniform_matched`/`uniform_coarse` checkbox enabled on the very last frame.
-`app/panels.py`'s non-Plotly logic (subsampling, the class-breakdown table) is covered by
-ordinary pytest in `tests/test_panels.py`.
+without a single exception: the initial render (four tabs, ~30 sidebar elements), Prev/Next at
+both sequence boundaries, the frame slider at an arbitrary and the last frame, a valid zone edit
+and an invalid one (confirmed to show the precise rejection message and keep the last valid
+ladder), the range/height filter sliders, emptying the drop-classes and devices multiselects,
+narrowing the filters to zero surviving points (confirmed to show the warning rather than
+crash), the Reset button, and the heaviest combined path — the last frame, the
+`uniform_matched`/`uniform_coarse` checkbox, and a live zone edit together. `app/panels.py`'s
+non-Plotly logic is covered in `tests/test_panels.py`.
+
+The one thing AppTest cannot safely exercise is the autoplay loop itself: `st.rerun()` inside a
+`playing=True` branch causes AppTest to unroll every subsequent script pass synchronously within
+one `.run()` call, with no way for a test to interject a Pause click mid-loop the way a real
+browser session's incoming message can — confirmed once, deliberately, as a timeout rather than
+a hang. The pure decision logic autoplay depends on (`next_playback_index`: advance by one, loop
+back to the start after the last frame) is instead unit-tested directly in
+`tests/test_dashboard_logic.py`, decoupled from Streamlit entirely.
 
 ---
 
@@ -432,7 +485,8 @@ ordinary pytest in `tests/test_panels.py`.
 
 ```
 avrmap/          processing library, no UI imports anywhere
-  config.py        typed config, validated on load
+  config.py        typed config, validated on load; validate_zones is public
+                   so the dashboard's live zone editor reuses it directly
   dataset.py       discovery, indexing, validation
   frames.py        Frame dataclass and cached loading
   geometry.py      quaternions, poses, the three coordinate frames
@@ -470,7 +524,11 @@ failure modes there: unpaired frames, row-count mismatches, missing columns, und
 labels, wrong pose counts. Tests marked `slow` read the actual dataset and skip cleanly when
 it is absent.
 
-177 tests total. `test_preprocess.py` covers each filter in isolation plus their overlap.
+210 tests total. `test_config.py` covers `load_config`'s validation for every rejected shape
+(empty/gapped/non-contiguous/finer-outward/non-integer-ratio zones, inverted range or height
+crops, an out-of-range zone ladder, unknown elevation statistics) and `validate_zones` directly,
+including the empty-tuple guard the live editor depends on not to crash on. `test_preprocess.py`
+covers each filter in isolation plus their overlap.
 `test_grids.py` covers the aggregation kernel with hand-computable answers (a flat plane, a
 dense square of known side and resolution, elevation statistics on `0..99`, semantic
 tie-breaking, `min_points_per_cell` filtering, `CellTable.concat`), the point-to-cell mapping
@@ -487,8 +545,10 @@ to `python scripts/run_benchmark.py`, not the test suite, since it takes a few m
 group filter against the same `group_of` logic computed one class at a time. `test_render.py`
 hand-verifies pixel placement, block sizing for larger cells, the background colour, and the
 image pixel cap. `test_panels.py` covers the dashboard's non-Plotly logic (subsampling, the
-class-breakdown table); the dashboard script itself is smoke-tested separately with
-`streamlit.testing.v1.AppTest` rather than pytest — see the Dashboard section above.
+class-breakdown table). `test_dashboard_logic.py` covers the autoplay index-advance function
+directly; the dashboard script itself is smoke-tested separately with `streamlit.testing.v1.AppTest`
+rather than pytest — see the Dashboard section above for what that verified and why the
+autoplay loop itself is the one thing it can't safely drive.
 
-The full suite takes about 30 s; `-m "not slow"` skips every dataset-backed test and finishes
-in about 1 s, useful while iterating on code that doesn't touch the real files.
+The full suite takes about 20-30 s; `-m "not slow"` skips every dataset-backed test and
+finishes in about 1 s, useful while iterating on code that doesn't touch the real files.

@@ -125,8 +125,16 @@ def _parse_zones(raw: Any) -> tuple[ZoneConfig, ...]:
     return tuple(zones)
 
 
-def _validate_zones(zones: tuple[ZoneConfig, ...]) -> None:
-    """Zones must tile the range without gaps or overlap, coarsening outwards."""
+def validate_zones(zones: tuple[ZoneConfig, ...]) -> None:
+    """Zones must tile the range without gaps or overlap, coarsening outwards.
+
+    Public (not prefixed with an underscore) because the dashboard's live
+    zone editor (Milestone 6) reuses this exact check before rebuilding the
+    adaptive grid with user-edited zones, rather than re-implementing a
+    second, possibly-diverging notion of "valid zones".
+    """
+    if not zones:
+        raise ConfigError("grid.zones must not be empty")
     if zones[0].r_min != 0.0:
         raise ConfigError("the first grid zone must start at r_min: 0.0")
     for prev, cur in zip(zones, zones[1:]):
@@ -160,8 +168,11 @@ def load_config(path: str | Path) -> PipelineConfig:
     raw = _require_mapping(raw, "<root>")
 
     ds = _require_mapping(raw.get("dataset"), "dataset")
-    # A relative dataset root resolves against the project root, which is the
-    # parent of the configs/ directory holding this file.
+    # A relative dataset root resolves two directories above the config file
+    # itself, i.e. it assumes the config lives at <project_root>/configs/*.yaml,
+    # exactly where default_config_path() and every script's --config flag in
+    # this repo expect it. A config file placed anywhere else must use an
+    # absolute dataset.root.
     root = Path(ds.get("root", "."))
     if not root.is_absolute():
         root = (path.resolve().parent.parent / root).resolve()
@@ -185,7 +196,7 @@ def load_config(path: str | Path) -> PipelineConfig:
 
     gd = _require_mapping(raw.get("grid"), "grid")
     zones = _parse_zones(gd.get("zones"))
-    _validate_zones(zones)
+    validate_zones(zones)
     stat = str(gd.get("elevation_stat", "p95"))
     if stat not in VALID_ELEVATION_STATS:
         raise ConfigError(
