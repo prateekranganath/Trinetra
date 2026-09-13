@@ -157,3 +157,33 @@ def group_mask(labels: np.ndarray, group: str) -> np.ndarray:
     if group not in lookup:
         raise ValueError(f"unknown class group '{group}', expected one of {sorted(lookup)}")
     return np.isin(labels, np.asarray(lookup[group], dtype=labels.dtype))
+
+
+#: Every group name :func:`group_of` can return, in a fixed order so it can
+#: double as an index into a lookup table.
+GROUP_NAMES: tuple[str, ...] = ("unlabeled", "noise", "ground", "dynamic", "static", "other")
+
+
+def build_group_lookup(max_class_id: int = 255) -> np.ndarray:
+    """(max_class_id + 1,) uint8 table mapping a class id to its index in
+    :data:`GROUP_NAMES`, for vectorized group filtering of a whole labels
+    array without a Python-level call to :func:`group_of` per point."""
+    table = np.empty(max_class_id + 1, dtype=np.uint8)
+    for cid in range(max_class_id + 1):
+        table[cid] = GROUP_NAMES.index(group_of(cid))
+    return table
+
+
+def groups_mask(labels: np.ndarray, groups: list[str], lookup: np.ndarray | None = None) -> np.ndarray:
+    """Boolean mask selecting points whose class belongs to any of ``groups``.
+
+    Vectorized: one table lookup over all of ``labels`` plus one
+    ``np.isin``, rather than a Python loop calling :func:`group_of` per point.
+    """
+    if lookup is None:
+        lookup = build_group_lookup()
+    unknown = set(groups) - set(GROUP_NAMES)
+    if unknown:
+        raise ValueError(f"unknown group name(s) {sorted(unknown)}, expected one of {GROUP_NAMES}")
+    wanted_ids = [GROUP_NAMES.index(g) for g in groups]
+    return np.isin(lookup[labels], wanted_ids)

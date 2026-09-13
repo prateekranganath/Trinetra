@@ -21,7 +21,7 @@ estimated.
 | 2. Preprocessing and uniform grid | **done** |
 | 3. Adaptive grid | **done** |
 | 4. Benchmark harness | **done** |
-| 5. Dashboard | not started |
+| 5. Dashboard | **done** |
 | 6. Playback | not started |
 | 7. Multi-frame accumulation and demo | not started |
 
@@ -50,6 +50,7 @@ python scripts/validate_dataset.py --quick  # first, middle and last frame only
 python scripts/build_uniform_map.py         # preprocess + grid one frame, print a summary
 python scripts/compare_grids.py             # uniform vs. adaptive on one frame
 python scripts/run_benchmark.py             # full benchmark, all 80 frames, a few minutes
+streamlit run app/dashboard.py              # dashboard, opens at localhost:8501
 python -m pytest -q                         # full suite, about 30 s
 python -m pytest -q -m "not slow"           # skip tests that read the real data, about 1 s
 ```
@@ -359,10 +360,71 @@ benchmark reports that trade honestly rather than only in the band that flatters
 | Cell reduction percentages | derived from two measured counts |
 | Elevation RMSE, semantic agreement | measured, against the frame's own points |
 | `build_only_fps_estimate` (e.g. adaptive: 13.7, `uniform_fine`: 10.9) | derived from build time alone; excludes frame load, preprocessing, and all rendering |
-| Render / UI FPS | **unavailable** — no dashboard exists yet (Milestone 5); reported as such in `benchmark_summary.json`, never estimated |
+| Render / UI FPS | **unavailable** — the dashboard (below) has no playback loop yet to time; Milestone 6 measures actual Streamlit rerun latency instead of estimating it |
 
 Reproduce with `python scripts/run_benchmark.py` (a few minutes for all 80 frames), or
 `--frames 10` / `--frames 00,10,20` for a quicker pass while iterating.
+
+---
+
+## The dashboard
+
+`streamlit run app/dashboard.py` opens a browser-based dashboard at `localhost:8501`. It wires
+Streamlit widgets directly to the `avrmap` library — it loads no pickles, filters no points, and
+builds no grids itself; `app/panels.py` builds every Plotly figure from data the dashboard
+already has, so neither file duplicates logic that belongs in `avrmap`.
+
+**Sidebar.** Sequence selector (one sequence today; the dropdown works for more without any
+code change, since discovery is already multi-sequence-capable). Frame selection by slider or
+Prev/Next buttons. A dataset-status expander running the same validation from Milestone 1.
+Display controls for the 3D point cap and which semantic groups to show. Read-only expanders
+listing the current zone ladder and preprocessing filters — read-only because live-editable
+zone and filter controls that trigger a rebuild are Milestone 6's job, not this one's.
+
+**Tabs.**
+
+- **3D Point Cloud** — the raw cloud coloured by elevation, and the semantic cloud coloured by
+  the PandaSet palette, side by side, both subsampled to the configured point cap with a fixed
+  random seed so the same points show on every rerun. A class-breakdown table lists every
+  semantic class present in the frame with its point count.
+- **2.5D Maps** — uniform and adaptive elevation rasters on a shared colour scale, their
+  semantic-class rasters, and a zone/cell-size raster that makes the fovea visible at a glance:
+  each pixel is coloured by which distance zone (and therefore which cell size) produced it.
+- **Comparison** — cell counts side by side, a live reduction percentage, table memory for both,
+  and the near-field cell-count check (should match closely, since both grids use the same cell
+  size inside the innermost zone).
+- **Metrics** — cost and per-band quality for `uniform_fine` and adaptive, computed live for the
+  selected frame via the same `avrmap.metrics` functions the benchmark script uses.
+  `uniform_coarse` and `uniform_matched` are gated behind a checkbox rather than computed on
+  every rerun, since the matched-size bisection search costs a few hundred milliseconds per
+  frame. Below that, the full 80-frame `results/benchmark_summary.json` is shown for reference
+  when present, with an `st.info` pointing at `run_benchmark.py` when it isn't.
+
+**Rasterizing a sparse grid into an image.** `avrmap/render.py` paints a `CellTable` into a
+fixed-size array — a rendering device, never the storage format, exactly as the technical plan
+specifies. Cells sharing an edge length (every cell in a uniform grid; every cell in one
+adaptive zone) are painted together with one broadcasted fancy-index assignment per group,
+rather than a Python loop over cells. The image resolution is capped independently of the
+configured display resolution (900 px per side by default), so a very fine zone size can never
+make a dashboard rerun slow — the cap only coarsens the *picture*, never the underlying
+`CellTable` or any measurement taken from it.
+
+**Caching.** `st.cache_resource` covers dataset discovery and validation (per session, rarely
+invalidated); `st.cache_data` covers the per-frame load-preprocess-and-grid bundle, keyed on the
+config path, sequence id, and frame id — three plain strings, deliberately, rather than the
+dataclasses those resolve to, since Streamlit's hashing of custom objects is a needless risk to
+take when reloading a config and re-globbing a directory costs a few milliseconds anyway.
+
+**Testing the dashboard.** Streamlit's UI cannot be driven by ordinary pytest assertions on
+pixels, so `app/dashboard.py` is smoke-tested with `streamlit.testing.v1.AppTest`, which runs
+the actual script headlessly and surfaces any Python exception it raises. Verified this way,
+without a single exception: the initial render (all four tabs, thirteen sidebar elements), the
+Prev/Next buttons at both sequence boundaries (frame 0 and frame 79), the frame slider jumped
+to an arbitrary and to the last frame, the semantic-group multiselect cleared to empty, the
+point-count number input changed, the sequence selectbox re-selected, and — the most expensive
+combined path — the `uniform_matched`/`uniform_coarse` checkbox enabled on the very last frame.
+`app/panels.py`'s non-Plotly logic (subsampling, the class-breakdown table) is covered by
+ordinary pytest in `tests/test_panels.py`.
 
 ---
 
@@ -374,14 +436,17 @@ avrmap/          processing library, no UI imports anywhere
   dataset.py       discovery, indexing, validation
   frames.py        Frame dataclass and cached loading
   geometry.py      quaternions, poses, the three coordinate frames
-  semantics.py     class names, groups, colour palette
+  semantics.py     class names, groups, colour palette, vectorized group filtering
   preprocess.py    range/height crop, class and device filtering
   grids/
     common.py        CellTable, aggregate_cells, and its point-to-cell map
     uniform.py       the uniform grid, and the uniform_matched cell-size search
     adaptive.py      the foveated grid: per-zone cell sizes, concatenated
   metrics.py       build-time timing, dense-equivalent memory, per-band quality
-app/             Streamlit dashboard (milestone 5)
+  render.py        rasterizing a CellTable into a display image
+app/             Streamlit dashboard
+  dashboard.py     entry point: streamlit run app/dashboard.py
+  panels.py        Plotly figure builders, no Streamlit calls
 scripts/         command-line entry points, including run_benchmark.py
 configs/         default.yaml
 tests/           pytest suite, mirrors the module names
@@ -405,7 +470,7 @@ failure modes there: unpaired frames, row-count mismatches, missing columns, und
 labels, wrong pose counts. Tests marked `slow` read the actual dataset and skip cleanly when
 it is absent.
 
-131 tests total. `test_preprocess.py` covers each filter in isolation plus their overlap.
+177 tests total. `test_preprocess.py` covers each filter in isolation plus their overlap.
 `test_grids.py` covers the aggregation kernel with hand-computable answers (a flat plane, a
 dense square of known side and resolution, elevation statistics on `0..99`, semantic
 tie-breaking, `min_points_per_cell` filtering, `CellTable.concat`), the point-to-cell mapping
@@ -418,6 +483,12 @@ hand-verifies `quality_by_band`'s RMSE and agreement formulas, including unmatch
 empty bands. `test_run_benchmark.py` runs the benchmark CLI end to end on two frames and checks
 the CSV and summary it produces are structurally sound — the full 80-frame run itself is left
 to `python scripts/run_benchmark.py`, not the test suite, since it takes a few minutes.
+`test_semantics.py` covers class colours, the palette, group assignment, and the vectorized
+group filter against the same `group_of` logic computed one class at a time. `test_render.py`
+hand-verifies pixel placement, block sizing for larger cells, the background colour, and the
+image pixel cap. `test_panels.py` covers the dashboard's non-Plotly logic (subsampling, the
+class-breakdown table); the dashboard script itself is smoke-tested separately with
+`streamlit.testing.v1.AppTest` rather than pytest — see the Dashboard section above.
 
 The full suite takes about 30 s; `-m "not slow"` skips every dataset-backed test and finishes
 in about 1 s, useful while iterating on code that doesn't touch the real files.
