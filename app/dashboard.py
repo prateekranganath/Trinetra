@@ -97,6 +97,36 @@ def validate(config_path: str, seq_id: str):
     return validate_sequence(seq)
 
 
+@st.cache_data(show_spinner="Loading and preprocessing this frame...")
+def get_prebundle(
+    config_path: str,
+    seq_id: str,
+    frame_id: str,
+    min_range_m: float,
+    max_range_m: float,
+    z_min_m: float,
+    z_max_m: float,
+    drop_classes: tuple[int, ...],
+    devices: tuple[int, ...],
+):
+    """Load one frame and run preprocessing, caching the result alone.
+
+    Extracted from ``get_frame_bundle`` so a playback preloader can warm every
+    frame's points once without also holding every frame's grids in memory —
+    the slow ~1 s per frame is the pickle load, and that is what Play would
+    otherwise re-pay on every first visit.
+    """
+    cfg = load_config(config_path)
+    seq = require_sequence(cfg.dataset.root, cfg.dataset.max_search_depth, seq_id=seq_id)
+    frame = load_frame(seq, frame_id)
+    pp = PreprocessConfig(
+        min_range_m=min_range_m, max_range_m=max_range_m,
+        z_min_m=z_min_m, z_max_m=z_max_m,
+        drop_classes=drop_classes, devices=devices,
+    )
+    return preprocess_frame(frame, pp)
+
+
 @st.cache_data(show_spinner="Loading, preprocessing, and gridding this frame...")
 def get_frame_bundle(
     config_path: str,
@@ -114,18 +144,16 @@ def get_frame_bundle(
 ):
     cfg = load_config(config_path)
     seq = require_sequence(cfg.dataset.root, cfg.dataset.max_search_depth, seq_id=seq_id)
-    frame = load_frame(seq, frame_id)
-    pp = PreprocessConfig(
-        min_range_m=min_range_m, max_range_m=max_range_m,
-        z_min_m=z_min_m, z_max_m=z_max_m,
-        drop_classes=drop_classes, devices=devices,
+    points = get_prebundle(
+        config_path, seq_id, frame_id,
+        min_range_m, max_range_m, z_min_m, z_max_m, drop_classes, devices,
     )
-    pre = preprocess_frame(frame, pp)
+    del seq
     zone_objs = tuple(ZoneConfig(r_min=r0, r_max=r1, cell_m=c) for r0, r1, c in zones)
     uniform_cell_m = min(c for _, _, c in zones)  # uniform_fine tracks the finest edited zone
-    uniform = build_uniform_map_with_point_cells(pre, uniform_cell_m, min_points_per_cell, elevation_stat)
-    adaptive = build_adaptive_map_with_point_cells(pre, zone_objs, min_points_per_cell, elevation_stat)
-    return frame, pre, uniform, adaptive
+    uniform = build_uniform_map_with_point_cells(points, uniform_cell_m, min_points_per_cell, elevation_stat)
+    adaptive = build_adaptive_map_with_point_cells(points, zone_objs, min_points_per_cell, elevation_stat)
+    return points, uniform, adaptive
 
 
 @st.cache_data(show_spinner="Building uniform_coarse and searching for uniform_matched...")
@@ -218,6 +246,49 @@ def next_playback_index(current: int, n_frames: int) -> int:
     """The next frame index during autoplay: advance by one, then loop back
     to the start after the last frame."""
     return 0 if current >= n_frames - 1 else current + 1
+
+
+def frame_prefetch_key(seq_id: str, preprocess_cfg: PreprocessConfig) -> tuple:
+    """Cache key describing what ``get_prebundle`` caches: the sequence and
+    the preprocessing filters, not the zone ladder (zones never affect ``pre``)."""
+    return (
+        seq_id,
+        float(preprocess_cfg.min_range_m), float(preprocess_cfg.max_range_m),
+        float(preprocess_cfg.z_min_m), float(preprocess_cfg.z_max_m),
+        tuple(preprocess_cfg.drop_classes), tuple(preprocess_cfg.devices),
+    )
+
+
+def run_preload_all(
+    seq,
+    config_path: str,
+    seq_id: str,
+    preprocess_cfg: PreprocessConfig,
+) -> int:
+    """Warm ``get_prebundle``'s cache for every frame of ``seq`` once.
+
+    This is exactly what makes Play smooth: the ~1 s per frame is the one-time
+    pickle load, paid here once with a visible progress bar instead of being
+    re-paid on every first visit during playback. A single frame failing to
+    load is not fatal — it is skipped and counted, so one corrupt frame cannot
+    block the whole preload.
+    """
+    n = len(seq.frame_ids)
+    bar = st.sidebar.progress(0.0, text=f"Preloading {n} frames (first time only)")
+    ok = 0
+    for i, frame_id in enumerate(seq.frame_ids):
+        try:
+            get_prebundle(
+                config_path, seq_id, frame_id,
+                preprocess_cfg.min_range_m, preprocess_cfg.max_range_m,
+                preprocess_cfg.z_min_m, preprocess_cfg.z_max_m,
+                tuple(preprocess_cfg.drop_classes), tuple(preprocess_cfg.devices),
+            )
+            ok += 1
+        except Exception:  # noqa: BLE001 - keep going on a corrupt frame
+            pass
+        bar.progress((i + 1) / n, text=f"Preloaded {i + 1}/{n} frames")
+    return ok
 
 
 # --------------------------------------------------------------------------
@@ -334,6 +405,10 @@ def main() -> None:
         st.session_state.rerun_ts = deque(maxlen=FPS_WINDOW)
     if "last_valid_zones" not in st.session_state:
         st.session_state.last_valid_zones = cfg.grid.zones
+    if "auto_preload" not in st.session_state:
+        st.session_state.auto_preload = True
+    if "prefetch_key" not in st.session_state:
+        st.session_state.prefetch_key = None
     st.session_state.frame_idx = min(st.session_state.frame_idx, len(seq) - 1)
 
     st.sidebar.header("Frame")
@@ -430,9 +505,36 @@ def main() -> None:
     with st.sidebar.expander("Preprocessing filters (editable)", expanded=False):
         preprocess_cfg = filter_editor(cfg.preprocess, classes)
 
+    # --- playback preloading --------------------------------------------------
+    # First visit to each frame costs ~1 s picking the lidar pickle. Warm every
+    # frame through get_prebundle once (visible progress bar), then Play only
+    # re-builds grids, which are cached too — smooth, accurate animation.
+    with st.sidebar.expander("Playback preloading (live demo)", expanded=False):
+        st.caption(
+            "Loads the points of all frames at once, so Play steps smoothly "
+            "instead of paying ~1 s of pickle reading on every first visit."
+        )
+        st.checkbox(
+            "Auto-preload when the sequence or filters change",
+            value=True, key="auto_preload",
+        )
+        if st.button("Preload all frames now"):
+            ready = run_preload_all(seq, config_path, seq_id, preprocess_cfg)
+            st.success(f"Preloaded {ready}/{len(seq)} frames.")
+            st.session_state.prefetch_key = frame_prefetch_key(seq_id, preprocess_cfg)
+
+    if (
+        st.session_state.auto_preload
+        and st.session_state.prefetch_key != frame_prefetch_key(seq_id, preprocess_cfg)
+        and not st.session_state.playing
+    ):
+        ready = run_preload_all(seq, config_path, seq_id, preprocess_cfg)
+        st.session_state.prefetch_key = frame_prefetch_key(seq_id, preprocess_cfg)
+        st.sidebar.success(f"Preloaded {ready}/{len(seq)} frames for smooth playback.")
+
     # --- load & grid this frame --------------------------------------------
     try:
-        frame, pre, (uniform_table, uniform_rows), (adaptive_table, adaptive_rows) = get_frame_bundle(
+        pre, (uniform_table, uniform_rows), (adaptive_table, adaptive_rows) = get_frame_bundle(
             config_path, seq_id, frame_id,
             preprocess_cfg.min_range_m, preprocess_cfg.max_range_m,
             preprocess_cfg.z_min_m, preprocess_cfg.z_max_m,
@@ -468,7 +570,8 @@ def main() -> None:
         idx = idx[panels.subsample_indices(len(idx), max_points_3d)]
         st.caption(
             f"{pre.n_kept:,} points after preprocessing; showing {len(idx):,} "
-            f"after the group filter and the {max_points_3d:,}-point display cap."
+            f"after the group filter and the {max_points_3d:,}-point display cap. "
+            "Drag to rotate, scroll to zoom, double-click to reset."
         )
         c1, c2 = st.columns(2)
         with c1:
@@ -497,34 +600,37 @@ def main() -> None:
         else:
             zmin, zmax = 0.0, 1.0
 
+        st.caption(
+            "White dashed circles mark the distance-zone boundaries; the small "
+            "labels show the cell size used in each ring (fine near the ego, "
+            "coarse far away). The ego vehicle sits at the centre. Drag to pan, "
+            "scroll to zoom, double-click to reset."
+        )
+
         c1, c2 = st.columns(2)
         with c1:
             st.markdown(f"**Uniform grid** — {uniform_cell_m:g} m cells, {len(uniform_table):,} cells")
             r = rasterize_scalar(uniform_table, uniform_table.z_ref, extent, res)
-            st.plotly_chart(
-                panels.raster_scalar_figure(r, "Viridis", "Uniform — elevation", "z_ref (m)", zmin, zmax),
-                width="stretch",
-            )
+            fig = panels.raster_scalar_figure(r, "Viridis", "Uniform — elevation", "z_ref (m)", zmin, zmax)
+            st.plotly_chart(panels.add_resolution_zones(fig, zones), width="stretch")
         with c2:
             st.markdown(f"**Adaptive grid** — {len(zones)} zones, {len(adaptive_table):,} cells")
             r = rasterize_scalar(adaptive_table, adaptive_table.z_ref, extent, res)
-            st.plotly_chart(
-                panels.raster_scalar_figure(r, "Viridis", "Adaptive — elevation", "z_ref (m)", zmin, zmax),
-                width="stretch",
-            )
+            fig = panels.raster_scalar_figure(r, "Viridis", "Adaptive — elevation", "z_ref (m)", zmin, zmax)
+            st.plotly_chart(panels.add_resolution_zones(fig, zones), width="stretch")
 
         c3, c4 = st.columns(2)
         with c3:
             r = rasterize_semantic(uniform_table, extent, res)
-            st.plotly_chart(panels.raster_rgb_figure(r, "Uniform — semantic"), width="stretch")
+            fig = panels.raster_rgb_figure(r, "Uniform — semantic")
+            st.plotly_chart(panels.add_resolution_zones(fig, zones), width="stretch")
         with c4:
             r = rasterize_semantic(adaptive_table, extent, res)
-            st.plotly_chart(panels.raster_rgb_figure(r, "Adaptive — semantic"), width="stretch")
+            fig = panels.raster_rgb_figure(r, "Adaptive — semantic")
+            st.plotly_chart(panels.add_resolution_zones(fig, zones), width="stretch")
             rz = rasterize_zone(adaptive_table, extent, res)
-            st.plotly_chart(
-                panels.raster_zone_figure(rz, len(zones), "Adaptive — zone / cell-size map"),
-                width="stretch",
-            )
+            fig = panels.raster_zone_figure(rz, len(zones), "Adaptive — zone / cell-size map")
+            st.plotly_chart(panels.add_resolution_zones(fig, zones), width="stretch")
         if uncovered:
             st.warning(f"{uncovered:,} points fall outside every configured zone and are absent from the adaptive grid.")
 
@@ -692,13 +798,12 @@ def main() -> None:
         r1, r2 = st.columns(2)
         with r1:
             r = rasterize_scalar(acc_table, acc_table.z_ref, cfg.render.extent_m, cfg.render.display_res_m)
-            st.plotly_chart(
-                panels.raster_scalar_figure(r, "Viridis", "Fused — elevation", "z_ref (m)"),
-                width="stretch",
-            )
+            fig = panels.raster_scalar_figure(r, "Viridis", "Fused — elevation", "z_ref (m)")
+            st.plotly_chart(panels.add_resolution_zones(fig, zones), width="stretch")
         with r2:
             r = rasterize_semantic(acc_table, cfg.render.extent_m, cfg.render.display_res_m)
-            st.plotly_chart(panels.raster_rgb_figure(r, "Fused — semantic"), width="stretch")
+            fig = panels.raster_rgb_figure(r, "Fused — semantic")
+            st.plotly_chart(panels.add_resolution_zones(fig, zones), width="stretch")
 
         if include_dynamic_history:
             st.warning(
