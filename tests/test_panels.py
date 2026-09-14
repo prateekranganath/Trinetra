@@ -17,6 +17,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
 
 from panels import class_breakdown_table, subsample_indices  # noqa: E402
 
+from avrmap.config import ZoneConfig
+
+
+class TestAddResolutionZones:
+    def _fig(self):
+        import plotly.graph_objects as go
+
+        return go.Figure()
+
+    def test_adds_one_ring_and_label_per_zone_plus_ego_marker(self):
+        from panels import add_resolution_zones
+
+        zones = (
+            ZoneConfig(0.0, 10.0, 0.1),
+            ZoneConfig(10.0, 30.0, 0.2),
+            ZoneConfig(30.0, 60.0, 0.4),
+            ZoneConfig(60.0, 100.0, 0.8),
+        )
+        fig = add_resolution_zones(self._fig(), zones)
+
+        traces = [t for t in fig.data if t.mode == "lines"]
+        assert len(traces) == len(zones)  # one circle per zone boundary
+        markers = [t for t in fig.data if t.mode == "markers"]
+        assert len(markers) == 1  # the ego vehicle
+
+        radii = sorted(t.x.max() for t in traces)
+        assert np.allclose(radii, [z.r_max for z in zones])
+
+        labels = [a.text for a in fig.layout.annotations]
+        assert labels == [f"{z.cell_m:g} m" for z in zones]
+
+    def test_ring_radii_track_a_narrowed_ladder(self):
+        from panels import add_resolution_zones
+
+        zones = (ZoneConfig(0.0, 5.0, 0.05), ZoneConfig(5.0, 20.0, 0.1))
+        fig = add_resolution_zones(self._fig(), zones)
+        traces = [t for t in fig.data if t.mode == "lines"]
+        assert np.allclose(sorted(t.x.max() for t in traces), [5.0, 20.0])
+
 
 class TestSubsampleIndices:
     def test_returns_every_index_when_under_the_cap(self):

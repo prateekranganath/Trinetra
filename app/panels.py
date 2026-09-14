@@ -156,3 +156,50 @@ def band_quality_figure(band_labels: list[str], series: dict[str, list[float]], 
         margin=dict(l=0, r=0, t=30, b=0), height=360, legend=dict(orientation="h", y=-0.2),
     )
     return fig
+
+
+def add_resolution_zones(
+    fig: go.Figure,
+    zones,
+    *,
+    ring_color: str = "rgba(255,255,255,0.45)",
+    label_color: str = "#ffffff",
+    ring_width: float = 0.8,
+    label_angle_rad: float = np.pi / 4,
+    label_bgcolor: str = "rgba(0,0,0,0.45)",
+) -> go.Figure:
+    """Overlay the foveated resolution ladder onto a map figure.
+
+    Draws one dashed white concentric circle per zone boundary (the ``r_max``
+    of each zone, centred on the ego at the origin) plus a small, unobtrusive
+    label showing just that zone's cell size, and a marker for the ego vehicle
+    at the centre. Passing the *live* zone ladder means the overlay follows
+    the dashboard's zone editor exactly.
+    """
+    theta = np.linspace(0, 2 * np.pi, 240)
+    cx, cy = np.cos(theta), np.sin(theta)
+    for zone in zones:
+        fig.add_trace(
+            go.Scatter(
+                x=zone.r_max * cx, y=zone.r_max * cy, mode="lines",
+                line=dict(color=ring_color, width=ring_width, dash="dot"),
+                hoverinfo="skip", showlegend=False,
+            )
+        )
+        mid = (zone.r_min + zone.r_max) / 2
+        fig.add_annotation(
+            x=mid * np.cos(label_angle_rad), y=mid * np.sin(label_angle_rad),
+            text=f"{zone.cell_m:g} m",
+            showarrow=False, font=dict(size=10, color=label_color),
+            bgcolor=label_bgcolor, borderwidth=0, borderpad=2,
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=[0.0], y=[0.0], mode="markers", name="ego vehicle",
+            marker=dict(size=9, color="white", symbol="circle",
+                        line=dict(color="#111111", width=1.5)),
+            hoverinfo="skip",
+        )
+    )
+    fig.update_layout(legend=dict(orientation="h", y=-0.18))
+    return fig
